@@ -26,6 +26,8 @@ const LABEL: Color = Color::White;
 const ACCENT: Color = Color::Cyan;
 const DANGER: Color = Color::Red;
 const SUCCESS: Color = Color::Green;
+/// A block that's been started but not finished yet.
+const OPEN: Color = Color::Yellow;
 
 fn gray_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
@@ -784,9 +786,11 @@ fn today_items(app: &App) -> Vec<ListItem<'static>> {
 /// showing where in the day the logged time falls (all rows share the same
 /// time-of-day scale so they're visually comparable).
 fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
-    let (week_start, _) = calc::week_bounds(app.today());
+    let today = app.today();
+    let now = Local::now().time();
+    let (week_start, _) = calc::week_bounds(today);
     let days = app.visible_days();
-    let (window_start, window_end) = day_window(&app.entries, week_start);
+    let (window_start, window_end) = day_window(&app.entries, week_start, now);
 
     days.into_iter()
         .map(|day| {
@@ -794,7 +798,15 @@ fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
             let total = calc::worked_minutes(&day_entries);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
             let bar_width = inner_width.saturating_sub(prefix.chars().count() as u16);
-            let cells = day_bar(&day_entries, window_start, window_end, bar_width as usize);
+            let cells = day_bar(
+                &day_entries,
+                window_start,
+                window_end,
+                bar_width as usize,
+                day,
+                today,
+                now,
+            );
 
             let mut spans = vec![Span::styled(prefix, Style::default().fg(LABEL))];
             spans.extend(bar_spans(&cells));
@@ -804,8 +816,13 @@ fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
 }
 
 /// The shared time-of-day window used to draw week-view bars: a sensible
-/// default workday, widened to cover any entry that falls outside it.
-fn day_window(entries: &[TimeEntry], week_start: NaiveDate) -> (NaiveTime, NaiveTime) {
+/// default workday, widened to cover any entry that falls outside it (and,
+/// if a block is still open, up to now so its in-progress span is visible).
+fn day_window(
+    entries: &[TimeEntry],
+    week_start: NaiveDate,
+    now: NaiveTime,
+) -> (NaiveTime, NaiveTime) {
     let default_start = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
     let default_end = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
     let week_entries = calc::entries_in_week(entries, week_start);
@@ -815,40 +832,64 @@ fn day_window(entries: &[TimeEntry], week_start: NaiveDate) -> (NaiveTime, Naive
         .min()
         .unwrap_or(default_start)
         .min(default_start);
-    let end = week_entries
+    let mut end = week_entries
         .iter()
         .filter_map(|e| e.end)
         .max()
         .unwrap_or(default_end)
         .max(default_end);
+    if week_entries.iter().any(|e| e.end.is_none()) {
+        end = end.max(now);
+    }
     (start, end)
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Cell {
+    Empty,
+    Worked,
+    /// Part of a block that's been started but not finished yet.
+    Open,
+}
+
 /// Rasterizes a day's entries across `width` columns spanning
-/// [window_start, window_end): true where a column's time falls inside a
-/// logged entry.
+/// [window_start, window_end). An open block (no end yet) fills from its
+/// start through `now` if `day` is `today`, or through the window's end
+/// otherwise (we have no better bound for a block left open on a past day).
 fn day_bar(
     entries: &[&TimeEntry],
     window_start: NaiveTime,
     window_end: NaiveTime,
     width: usize,
-) -> Vec<bool> {
+    day: NaiveDate,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> Vec<Cell> {
     if width == 0 {
         return Vec::new();
     }
+    let open = entries.iter().find(|e| e.end.is_none());
+    let open_end = if day == today { now } else { window_end };
     let total_minutes = (window_end - window_start).num_minutes().max(1);
     (0..width)
         .map(|c| {
             let offset = (c as i64 * total_minutes) / width as i64;
             let t = window_start + chrono::Duration::minutes(offset);
-            entries
+            let worked = entries
                 .iter()
-                .any(|e| e.end.is_some_and(|end| e.start <= t && t < end))
+                .any(|e| e.end.is_some_and(|end| e.start <= t && t < end));
+            if worked {
+                Cell::Worked
+            } else if open.is_some_and(|o| o.start <= t && t < open_end) {
+                Cell::Open
+            } else {
+                Cell::Empty
+            }
         })
         .collect()
 }
 
-fn bar_spans(cells: &[bool]) -> Vec<Span<'static>> {
+fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut i = 0;
     while i < cells.len() {
@@ -857,11 +898,10 @@ fn bar_spans(cells: &[bool]) -> Vec<Span<'static>> {
         while j < cells.len() && cells[j] == value {
             j += 1;
         }
-        let ch = if value { '█' } else { '·' };
-        let style = if value {
-            Style::default().fg(ACCENT)
-        } else {
-            Style::default().fg(MUTED)
+        let (ch, style) = match value {
+            Cell::Worked => ('█', Style::default().fg(ACCENT)),
+            Cell::Open => ('█', Style::default().fg(OPEN)),
+            Cell::Empty => ('·', Style::default().fg(MUTED)),
         };
         spans.push(Span::styled(ch.to_string().repeat(j - i), style));
         i = j;
