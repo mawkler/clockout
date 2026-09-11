@@ -73,13 +73,45 @@ pub fn leave_time(
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
-    let left = minutes_left_today(entries, cfg, today);
+    leave_time_after(
+        minutes_left_today(entries, cfg, today),
+        entries,
+        cfg,
+        today,
+        now,
+    )
+}
+
+/// Leave time if today should also pay off the rest of the week's shortfall
+/// (any prior days under target), not just today's own even split.
+pub fn leave_time_week(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> NaiveTime {
+    leave_time_after(
+        minutes_left_week(entries, cfg, today),
+        entries,
+        cfg,
+        today,
+        now,
+    )
+}
+
+fn leave_time_after(
+    minutes_owed: i64,
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> NaiveTime {
     let projected_break = if today_gaps(entries, today).is_empty() {
         cfg.future_break_minutes as i64
     } else {
         0
     };
-    now + Duration::minutes(left + projected_break)
+    now + Duration::minutes(minutes_owed + projected_break)
 }
 
 /// True if two entries on the same day overlap. Adjacency (a.end == b.start)
@@ -252,6 +284,44 @@ mod tests {
         let now = NaiveTime::parse_from_str("12:00", "%H:%M").unwrap();
         let leave = leave_time(&entries, &c, d, now);
         assert_eq!(leave, NaiveTime::parse_from_str("16:00", "%H:%M").unwrap());
+    }
+
+    #[test]
+    fn leave_time_week_pays_off_prior_shortfall() {
+        let c = cfg(40.0, 0);
+        // Monday-Thursday only 4h/day logged (target 8h/day => 16h shortfall).
+        let monday = date(2026, 9, 7);
+        let mut entries = vec![
+            entry(1, monday, "08:00", "12:00"),
+            entry(2, date(2026, 9, 8), "08:00", "12:00"),
+            entry(3, date(2026, 9, 9), "08:00", "12:00"),
+            entry(4, date(2026, 9, 10), "08:00", "12:00"),
+        ];
+        let friday = date(2026, 9, 11);
+        entries.push(entry(5, friday, "08:00", "12:00")); // 4h today too
+        let now = NaiveTime::parse_from_str("12:00", "%H:%M").unwrap();
+
+        // Today-only target (8h/day): 4h left.
+        assert_eq!(
+            leave_time(&entries, &c, friday, now),
+            NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
+        );
+        // Full week (40h goal, 20h worked so far): 20h left, wraps past midnight.
+        assert_eq!(
+            leave_time_week(&entries, &c, friday, now),
+            NaiveTime::parse_from_str("08:00", "%H:%M").unwrap()
+        );
+    }
+
+    #[test]
+    fn leave_time_week_matches_today_when_week_goal_already_met() {
+        let c = cfg(10.0, 0);
+        let monday = date(2026, 9, 7);
+        // Week goal (10h) already met on Monday alone; nothing owed today.
+        let entries = vec![entry(1, monday, "08:00", "18:00")];
+        let friday = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
+        assert_eq!(leave_time_week(&entries, &c, friday, now), now);
     }
 
     #[test]

@@ -433,13 +433,20 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
     let worked_week = calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start));
     let goal_week = calc::weekly_goal_minutes(&app.config);
     let left_week = calc::minutes_left_week(&app.entries, &app.config, today);
+    let now = Local::now().time();
+    let clear_debt_by = calc::leave_time_week(&app.entries, &app.config, today, now);
 
     let label = Style::default().fg(LABEL);
     let value = Style::default().add_modifier(Modifier::BOLD);
 
-    let stat_line = |prefix: &str, worked: i64, of: &str, total: i64, remaining: i64| {
+    let stat_line = |prefix: &str,
+                     worked: i64,
+                     of: &str,
+                     total: i64,
+                     remaining: i64,
+                     clear_by: Option<NaiveTime>| {
         let left_color = if remaining == 0 { SUCCESS } else { ACCENT };
-        Line::from(vec![
+        let mut spans = vec![
             Span::styled(prefix.to_string(), label),
             Span::styled(calc::format_hm(worked), value),
             Span::styled(format!(" / {} {of} ", calc::format_hm(total)), label),
@@ -447,7 +454,15 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
                 format!("({} left)", calc::format_hm(remaining)),
                 Style::default().fg(left_color).add_modifier(Modifier::BOLD),
             ),
-        ])
+        ];
+        if let Some(t) = clear_by {
+            spans.push(Span::styled(" · clear time debt by ", label));
+            spans.push(Span::styled(
+                t.format("%H:%M").to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ));
+        }
+        Line::from(spans)
     };
 
     let lines = vec![
@@ -457,8 +472,16 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
             "target",
             target_today,
             left_today,
+            None,
         ),
-        stat_line("This week: ", worked_week, "goal", goal_week, left_week),
+        stat_line(
+            "This week: ",
+            worked_week,
+            "goal",
+            goal_week,
+            left_week,
+            Some(clear_debt_by),
+        ),
     ];
     let p = Paragraph::new(lines).block(gray_block(""));
     f.render_widget(p, area);

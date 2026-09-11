@@ -155,6 +155,11 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         calc::format_hm(goal_week),
         calc::format_hm(left_week)
     );
+    let clear_debt_by = calc::leave_time_week(&data.entries, &cfg, today, now);
+    println!(
+        "Clear time debt by: {} (pay off the whole week today)",
+        clear_debt_by.format("%H:%M")
+    );
     Ok(())
 }
 
