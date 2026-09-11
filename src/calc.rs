@@ -88,11 +88,19 @@ pub fn overlaps(a: &TimeEntry, b: &TimeEntry) -> bool {
     a.start < b.end && b.start < a.end
 }
 
-/// Formats a minute count as "XhYYm", e.g. 495 -> "8h15m".
+/// Formats a minute count as "Xh" when there are no leftover minutes, or
+/// "XhYYm" otherwise, e.g. 240 -> "4h", 270 -> "4h30m", 30 -> "30m".
 pub fn format_hm(minutes: i64) -> String {
     let sign = if minutes < 0 { "-" } else { "" };
     let abs = minutes.abs();
-    format!("{sign}{}h{:02}m", abs / 60, abs % 60)
+    let h = abs / 60;
+    let m = abs % 60;
+    match (h, m) {
+        (0, 0) => format!("{sign}0h"),
+        (_, 0) => format!("{sign}{h}h"),
+        (0, _) => format!("{sign}{m}m"),
+        _ => format!("{sign}{h}h{m:02}m"),
+    }
 }
 
 #[cfg(test)]
@@ -202,6 +210,15 @@ mod tests {
         // unsorted input still produces a correctly ordered gap
         let unsorted = vec![entry(2, d, "13:00", "15:15"), entry(1, d, "08:00", "12:00")];
         assert_eq!(today_gaps(&unsorted, d), vec![(t("12:00"), t("13:00"))]);
+    }
+
+    #[test]
+    fn format_hm_omits_zero_minutes() {
+        assert_eq!(format_hm(240), "4h");
+        assert_eq!(format_hm(270), "4h30m");
+        assert_eq!(format_hm(30), "30m");
+        assert_eq!(format_hm(0), "0h");
+        assert_eq!(format_hm(-90), "-1h30m");
     }
 
     #[test]
