@@ -73,6 +73,11 @@ struct ModalState {
     /// The single time field used by Start/End modals.
     time_buf: String,
     focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for Start/End
+    /// True while the focused field's existing text hasn't been touched yet:
+    /// it renders as selected, and the next keystroke overwrites it instead
+    /// of appending (like a browser text input). Reset on every focus
+    /// change; cleared by the first edit to the field.
+    field_selected: bool,
     error: Option<String>,
 }
 
@@ -175,6 +180,7 @@ impl App {
             end_buf: String::new(),
             time_buf: String::new(),
             focus: 1,
+            field_selected: true,
             error: None,
         });
     }
@@ -192,6 +198,7 @@ impl App {
                     .unwrap_or_default(),
                 time_buf: String::new(),
                 focus: 1,
+                field_selected: true,
                 error: None,
             });
         }
@@ -218,6 +225,7 @@ impl App {
             end_buf: String::new(),
             time_buf: Local::now().time().format("%H:%M").to_string(),
             focus: 0,
+            field_selected: true,
             error: None,
         });
     }
@@ -240,6 +248,7 @@ impl App {
             end_buf: String::new(),
             time_buf: Local::now().time().format("%H:%M").to_string(),
             focus: 0,
+            field_selected: true,
             error: None,
         });
     }
@@ -552,16 +561,29 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
             match code {
                 KeyCode::Esc => app.mode = Mode::Normal,
                 KeyCode::Enter => app.submit_modal()?,
-                KeyCode::Tab | KeyCode::Down => m.focus = (m.focus + 1) % field_count,
+                KeyCode::Tab | KeyCode::Down => {
+                    m.focus = (m.focus + 1) % field_count;
+                    m.field_selected = true;
+                }
                 KeyCode::BackTab | KeyCode::Up => {
                     m.focus = (m.focus + field_count - 1) % field_count;
+                    m.field_selected = true;
                 }
                 KeyCode::Backspace => {
                     m.error = None;
-                    current_buf(m).pop();
+                    if m.field_selected {
+                        current_buf(m).clear();
+                        m.field_selected = false;
+                    } else {
+                        current_buf(m).pop();
+                    }
                 }
                 KeyCode::Char(c) => {
                     m.error = None;
+                    if m.field_selected {
+                        current_buf(m).clear();
+                        m.field_selected = false;
+                    }
                     current_buf(m).push(c);
                 }
                 _ => {}
@@ -719,7 +741,7 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
 
     let items: Vec<ListItem> = match app.view {
         View::Today => today_items(app),
-        View::Week => week_items(app, inner_width),
+        View::Week => week_items(app, inner_width, app.selected),
     };
     let no_entries = items.is_empty();
     let items = if no_entries {
@@ -737,14 +759,18 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected.min(len - 1)));
     }
 
-    // Reversed (not a hardcoded fg/bg) so each span's own color still comes
-    // through on the selected row - important for the week view's bar, whose
-    // filled/empty cells would otherwise become indistinguishable.
-    let list = List::new(items).block(gray_block(title)).highlight_style(
-        Style::default()
+    // Week view marks the selected row itself (bolding its weekday/hours
+    // prefix in week_items) rather than inverting the whole line, since
+    // inverting would make the bar's own colors hard to read.
+    let highlight_style = match app.view {
+        View::Today => Style::default()
             .add_modifier(Modifier::REVERSED)
             .add_modifier(Modifier::BOLD),
-    );
+        View::Week => Style::default(),
+    };
+    let list = List::new(items)
+        .block(gray_block(title))
+        .highlight_style(highlight_style);
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -785,7 +811,7 @@ fn today_items(app: &App) -> Vec<ListItem<'static>> {
 /// One summary row per worked day: weekday name, total hours, and a bar
 /// showing where in the day the logged time falls (all rows share the same
 /// time-of-day scale so they're visually comparable).
-fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
+fn week_items(app: &App, inner_width: u16, selected: usize) -> Vec<ListItem<'static>> {
     let today = app.today();
     let now = Local::now().time();
     let (week_start, _) = calc::week_bounds(today);
@@ -793,7 +819,8 @@ fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
     let (window_start, window_end) = day_window(&app.entries, week_start, now);
 
     days.into_iter()
-        .map(|day| {
+        .enumerate()
+        .map(|(i, day)| {
             let day_entries = calc::entries_on(&app.entries, day);
             let total = calc::worked_minutes(&day_entries);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
@@ -808,7 +835,17 @@ fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
                 now,
             );
 
-            let mut spans = vec![Span::styled(prefix, Style::default().fg(LABEL))];
+            // Mark the selected row on its prefix only - inverting the
+            // whole line would make the bar's own colors hard to read.
+            let prefix_style = if i == selected {
+                Style::default()
+                    .fg(LABEL)
+                    .add_modifier(Modifier::REVERSED)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(LABEL)
+            };
+            let mut spans = vec![Span::styled(prefix, prefix_style)];
             spans.extend(bar_spans(&cells));
             ListItem::new(Line::from(spans))
         })
@@ -956,19 +993,29 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
-fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
-    let style = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD)
+/// Renders a modal input field. When focused, shows either the existing
+/// text as "selected" (about to be overwritten by the next keystroke) or,
+/// once edited, plain text with a block cursor trailing it - mirroring how
+/// a browser text input behaves.
+fn field_line(label: &str, value: &str, focused: bool, field_selected: bool) -> Line<'static> {
+    let label_span = Span::styled(format!("{label}: "), Style::default().fg(LABEL));
+    if !focused {
+        return Line::from(vec![label_span, Span::raw(value.to_string())]);
+    }
+    let cursor_style = Style::default().fg(Color::Black).bg(ACCENT);
+    if field_selected {
+        let shown = if value.is_empty() { " " } else { value };
+        Line::from(vec![
+            label_span,
+            Span::styled(shown.to_string(), cursor_style.add_modifier(Modifier::BOLD)),
+        ])
     } else {
-        Style::default()
-    };
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(LABEL)),
-        Span::styled(value.to_string(), style),
-    ])
+        Line::from(vec![
+            label_span,
+            Span::raw(value.to_string()),
+            Span::styled(" ", cursor_style),
+        ])
+    }
 }
 
 fn draw_modal(f: &mut Frame, m: &ModalState) {
@@ -1008,15 +1055,26 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
             "Date (YYYY-MM-DD/today/yesterday)",
             &m.date_buf,
             m.focus == 0,
+            m.field_selected,
         )),
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(field_line("Start (HH:MM)", &m.start_buf, m.focus == 1)),
+        Paragraph::new(field_line(
+            "Start (HH:MM)",
+            &m.start_buf,
+            m.focus == 1,
+            m.field_selected,
+        )),
         chunks[1],
     );
     f.render_widget(
-        Paragraph::new(field_line("End   (HH:MM)", &m.end_buf, m.focus == 2)),
+        Paragraph::new(field_line(
+            "End   (HH:MM)",
+            &m.end_buf,
+            m.focus == 2,
+            m.field_selected,
+        )),
         chunks[2],
     );
     if let Some(err) = &m.error {
@@ -1055,7 +1113,7 @@ fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
         .split(inner);
 
     f.render_widget(
-        Paragraph::new(field_line(label, &m.time_buf, true)),
+        Paragraph::new(field_line(label, &m.time_buf, true, m.field_selected)),
         chunks[0],
     );
     if let Some(err) = &m.error {
