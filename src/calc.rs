@@ -2,8 +2,27 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
 use crate::model::{Config, TimeEntry};
 
+/// Minutes worked by this entry. An open entry (no end yet) contributes 0 -
+/// its duration isn't known until `time end` closes it.
 pub fn entry_minutes(e: &TimeEntry) -> i64 {
-    (e.end - e.start).num_minutes()
+    match e.end {
+        Some(end) => (end - e.start).num_minutes(),
+        None => 0,
+    }
+}
+
+/// The first entry with no end time (a block started via `time start` that
+/// hasn't been closed with `time end` yet). At most one is expected to exist.
+pub fn open_entry(entries: &[TimeEntry]) -> Option<&TimeEntry> {
+    entries.iter().find(|e| e.end.is_none())
+}
+
+/// Formats an entry's end for display: "HH:MM", or "…" while still open.
+pub fn format_end(end: Option<NaiveTime>) -> String {
+    match end {
+        Some(t) => t.format("%H:%M").to_string(),
+        None => "…".to_string(),
+    }
 }
 
 pub fn weekly_goal_minutes(cfg: &Config) -> i64 {
@@ -74,11 +93,14 @@ pub fn time_debt_minutes(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) 
 pub fn today_gaps(entries: &[TimeEntry], day: NaiveDate) -> Vec<(NaiveTime, NaiveTime)> {
     let mut day_entries = entries_on(entries, day);
     day_entries.sort_by_key(|e| e.start);
-    day_entries
-        .windows(2)
-        .filter(|&w| w[1].start > w[0].end)
-        .map(|w| (w[0].end, w[1].start))
-        .collect()
+    let mut gaps = Vec::new();
+    for w in day_entries.windows(2) {
+        // An open entry (w[0].end == None) has no end to gap from yet.
+        if let Some(end0) = w[0].end.filter(|&end0| w[1].start > end0) {
+            gaps.push((end0, w[1].start));
+        }
+    }
+    gaps
 }
 
 /// Projected clock time the user can leave today, assuming no further breaks
@@ -133,9 +155,14 @@ fn leave_time_after(
 }
 
 /// True if two entries on the same day overlap. Adjacency (a.end == b.start)
-/// does not count as overlap.
+/// does not count as overlap. An open entry (no end yet) is treated as
+/// running through the end of the day for this check, since anything is
+/// still in conflict with it until it's closed.
 pub fn overlaps(a: &TimeEntry, b: &TimeEntry) -> bool {
-    a.start < b.end && b.start < a.end
+    let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+    let a_end = a.end.unwrap_or(end_of_day);
+    let b_end = b.end.unwrap_or(end_of_day);
+    a.start < b_end && b.start < a_end
 }
 
 /// Formats a minute count as "Xh" when there are no leftover minutes, or
@@ -163,7 +190,16 @@ mod tests {
             id,
             date,
             start: NaiveTime::parse_from_str(start, "%H:%M").unwrap(),
-            end: NaiveTime::parse_from_str(end, "%H:%M").unwrap(),
+            end: Some(NaiveTime::parse_from_str(end, "%H:%M").unwrap()),
+        }
+    }
+
+    fn open(id: u64, date: NaiveDate, start: &str) -> TimeEntry {
+        TimeEntry {
+            id,
+            date,
+            start: NaiveTime::parse_from_str(start, "%H:%M").unwrap(),
+            end: None,
         }
     }
 
@@ -416,5 +452,64 @@ mod tests {
 
         let e = entry(4, d, "13:00", "15:00");
         assert!(!overlaps(&a, &e));
+    }
+
+    #[test]
+    fn overlaps_with_open_entry() {
+        let d = date(2026, 9, 11);
+        let o = open(1, d, "12:35");
+        // Anything starting at or after the open entry's start conflicts...
+        let later = entry(2, d, "13:00", "14:00");
+        assert!(overlaps(&o, &later));
+        // ...but something fully before it doesn't.
+        let earlier = entry(3, d, "08:00", "12:00");
+        assert!(!overlaps(&o, &earlier));
+    }
+
+    #[test]
+    fn entry_minutes_open_entry_is_zero() {
+        let d = date(2026, 9, 11);
+        assert_eq!(entry_minutes(&open(1, d, "12:35")), 0);
+    }
+
+    #[test]
+    fn open_entry_finds_the_unfinished_block() {
+        let d = date(2026, 9, 11);
+        assert_eq!(open_entry(&[]), None);
+        let entries = vec![entry(1, d, "08:00", "12:00"), open(2, d, "12:35")];
+        assert_eq!(open_entry(&entries).map(|e| e.id), Some(2));
+    }
+
+    #[test]
+    fn worked_minutes_ignores_open_entry() {
+        let d = date(2026, 9, 11);
+        let entries = vec![entry(1, d, "08:00", "12:00"), open(2, d, "12:35")];
+        assert_eq!(worked_minutes(&entries.iter().collect::<Vec<_>>()), 4 * 60);
+    }
+
+    #[test]
+    fn today_gaps_open_entry_as_right_side_still_gaps() {
+        let d = date(2026, 9, 11);
+        // Closed entry, then an open one - the gap between them (the break
+        // taken before resuming) is still real, reportable info.
+        let entries = vec![entry(1, d, "08:00", "12:00"), open(2, d, "13:00")];
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert_eq!(today_gaps(&entries, d), vec![(t("12:00"), t("13:00"))]);
+    }
+
+    #[test]
+    fn today_gaps_skips_open_entry_as_left_side() {
+        let d = date(2026, 9, 11);
+        // An open entry has no end yet, so nothing after it can be reported
+        // as a gap from it.
+        let entries = vec![open(1, d, "08:00"), entry(2, d, "13:00", "14:00")];
+        assert_eq!(today_gaps(&entries, d), vec![]);
+    }
+
+    #[test]
+    fn format_end_some_and_none() {
+        let t = NaiveTime::parse_from_str("12:35", "%H:%M").unwrap();
+        assert_eq!(format_end(Some(t)), "12:35");
+        assert_eq!(format_end(None), "…");
     }
 }

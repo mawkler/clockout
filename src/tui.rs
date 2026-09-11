@@ -46,12 +46,31 @@ enum Mode {
     ConfirmDelete(u64),
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum StatusKind {
+    Info,
+    Error,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum ModalKind {
+    /// Full 3-field add/edit form (date, start, end).
+    AddEdit,
+    /// Single time field: start an open-ended block.
+    Start,
+    /// Single time field: close the currently open block.
+    End,
+}
+
 struct ModalState {
+    kind: ModalKind,
     editing_id: Option<u64>,
     date_buf: String,
     start_buf: String,
     end_buf: String,
-    focus: usize, // 0=date, 1=start, 2=end
+    /// The single time field used by Start/End modals.
+    time_buf: String,
+    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for Start/End
     error: Option<String>,
 }
 
@@ -61,7 +80,7 @@ struct App {
     view: View,
     selected: usize,
     mode: Mode,
-    status: Option<String>,
+    status: Option<(StatusKind, String)>,
     quit: bool,
 }
 
@@ -147,10 +166,12 @@ impl App {
 
     fn open_add(&mut self) {
         self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::AddEdit,
             editing_id: None,
             date_buf: self.today().to_string(),
             start_buf: String::new(),
             end_buf: String::new(),
+            time_buf: String::new(),
             focus: 1,
             error: None,
         });
@@ -159,20 +180,89 @@ impl App {
     fn open_edit(&mut self) {
         if let Some(e) = self.selected_entry() {
             self.mode = Mode::Modal(ModalState {
+                kind: ModalKind::AddEdit,
                 editing_id: Some(e.id),
                 date_buf: e.date.to_string(),
                 start_buf: e.start.format("%H:%M").to_string(),
-                end_buf: e.end.format("%H:%M").to_string(),
+                end_buf: e
+                    .end
+                    .map(|t| t.format("%H:%M").to_string())
+                    .unwrap_or_default(),
+                time_buf: String::new(),
                 focus: 1,
                 error: None,
             });
         }
     }
 
+    /// Open the "start an open-ended block" modal, prefilled with now.
+    /// Refuses if a block is already open.
+    fn open_start(&mut self) {
+        if let Some(open) = calc::open_entry(&self.entries) {
+            self.status = Some((
+                StatusKind::Error,
+                format!(
+                    "already have an open block from {} - press f to finish it",
+                    open.start.format("%H:%M")
+                ),
+            ));
+            return;
+        }
+        self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::Start,
+            editing_id: None,
+            date_buf: String::new(),
+            start_buf: String::new(),
+            end_buf: String::new(),
+            time_buf: Local::now().time().format("%H:%M").to_string(),
+            focus: 0,
+            error: None,
+        });
+    }
+
+    /// Open the "finish the open block" modal, prefilled with now. Refuses
+    /// if there is no open block.
+    fn open_finish(&mut self) {
+        if calc::open_entry(&self.entries).is_none() {
+            self.status = Some((
+                StatusKind::Error,
+                "no open block to finish - press s to start one".to_string(),
+            ));
+            return;
+        }
+        self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::End,
+            editing_id: None,
+            date_buf: String::new(),
+            start_buf: String::new(),
+            end_buf: String::new(),
+            time_buf: Local::now().time().format("%H:%M").to_string(),
+            focus: 0,
+            error: None,
+        });
+    }
+
     fn submit_modal(&mut self) -> Result<()> {
+        let kind = match &self.mode {
+            Mode::Modal(m) => m.kind,
+            _ => return Ok(()),
+        };
+        match kind {
+            ModalKind::AddEdit => self.submit_add_edit(),
+            ModalKind::Start => self.submit_start(),
+            ModalKind::End => self.submit_end(),
+        }
+    }
+
+    fn submit_add_edit(&mut self) -> Result<()> {
         let Mode::Modal(m) = &self.mode else {
             return Ok(());
         };
+
+        if m.editing_id.is_none() && calc::open_entry(&self.entries).is_some() {
+            self.set_modal_error("finish the open block first (f)".to_string());
+            return Ok(());
+        }
 
         let date = parse::resolve_day_spec(&m.date_buf, self.today()).or_else(|_| {
             NaiveDate::parse_from_str(&m.date_buf, "%Y-%m-%d")
@@ -212,7 +302,7 @@ impl App {
             id: editing_id.unwrap_or(0),
             date,
             start,
-            end,
+            end: Some(end),
         };
 
         if let Some(conflict) = self.entries.iter().find(|e| {
@@ -222,7 +312,7 @@ impl App {
                 "overlaps existing entry #{} ({}-{})",
                 conflict.id,
                 conflict.start.format("%H:%M"),
-                conflict.end.format("%H:%M")
+                calc::format_end(conflict.end)
             ));
             return Ok(());
         }
@@ -232,7 +322,7 @@ impl App {
             if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
                 existing.date = date;
                 existing.start = start;
-                existing.end = end;
+                existing.end = Some(end);
             }
         } else {
             let id = data.next_id;
@@ -241,13 +331,126 @@ impl App {
                 id,
                 date,
                 start,
-                end,
+                end: Some(end),
             });
         }
         storage::save_entries(&data)?;
         self.entries = data.entries;
         self.mode = Mode::Normal;
-        self.status = Some("saved".to_string());
+        self.status = Some((StatusKind::Info, "saved".to_string()));
+        Ok(())
+    }
+
+    fn submit_start(&mut self) -> Result<()> {
+        let Mode::Modal(m) = &self.mode else {
+            return Ok(());
+        };
+        let time = match parse::parse_time(&m.time_buf) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_modal_error(e);
+                return Ok(());
+            }
+        };
+        if calc::open_entry(&self.entries).is_some() {
+            self.set_modal_error("already have an open block".to_string());
+            return Ok(());
+        }
+        let today = self.today();
+        let candidate = TimeEntry {
+            id: 0,
+            date: today,
+            start: time,
+            end: None,
+        };
+        if let Some(conflict) = self
+            .entries
+            .iter()
+            .find(|e| e.date == today && calc::overlaps(e, &candidate))
+        {
+            self.set_modal_error(format!(
+                "overlaps existing entry #{} ({}-{})",
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end)
+            ));
+            return Ok(());
+        }
+
+        let mut data = storage::load_entries()?;
+        let id = data.next_id;
+        data.next_id += 1;
+        data.entries.push(TimeEntry {
+            id,
+            date: today,
+            start: time,
+            end: None,
+        });
+        storage::save_entries(&data)?;
+        self.entries = data.entries;
+        self.mode = Mode::Normal;
+        self.status = Some((
+            StatusKind::Info,
+            format!("started at {}", time.format("%H:%M")),
+        ));
+        Ok(())
+    }
+
+    fn submit_end(&mut self) -> Result<()> {
+        let Mode::Modal(m) = &self.mode else {
+            return Ok(());
+        };
+        let time = match parse::parse_time(&m.time_buf) {
+            Ok(t) => t,
+            Err(e) => {
+                self.set_modal_error(e);
+                return Ok(());
+            }
+        };
+        let Some(open) = calc::open_entry(&self.entries) else {
+            self.set_modal_error("no open block".to_string());
+            return Ok(());
+        };
+        if time <= open.start {
+            self.set_modal_error("end must be after start".to_string());
+            return Ok(());
+        }
+        let (id, date, start) = (open.id, open.date, open.start);
+        let candidate = TimeEntry {
+            id,
+            date,
+            start,
+            end: Some(time),
+        };
+        if let Some(conflict) = self
+            .entries
+            .iter()
+            .find(|e| e.id != id && e.date == date && calc::overlaps(e, &candidate))
+        {
+            self.set_modal_error(format!(
+                "overlaps existing entry #{} ({}-{})",
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end)
+            ));
+            return Ok(());
+        }
+
+        let mut data = storage::load_entries()?;
+        if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
+            existing.end = Some(time);
+        }
+        storage::save_entries(&data)?;
+        self.entries = data.entries;
+        self.mode = Mode::Normal;
+        self.status = Some((
+            StatusKind::Info,
+            format!(
+                "finished {}-{}",
+                start.format("%H:%M"),
+                time.format("%H:%M")
+            ),
+        ));
         Ok(())
     }
 
@@ -269,7 +472,7 @@ impl App {
         storage::save_entries(&data)?;
         self.entries = data.entries;
         self.mode = Mode::Normal;
-        self.status = Some(format!("deleted #{id}"));
+        self.status = Some((StatusKind::Info, format!("deleted #{id}")));
         Ok(())
     }
 }
@@ -314,6 +517,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         Mode::Normal => match code {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('a') => app.open_add(),
+            KeyCode::Char('s') => app.open_start(),
+            KeyCode::Char('f') => app.open_finish(),
             KeyCode::Char('e') if app.view == View::Today => app.open_edit(),
             KeyCode::Char('d') if app.view == View::Today => app.request_delete(),
             KeyCode::Char('r') => app.reload()?,
@@ -337,30 +542,41 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 _ => {}
             }
         }
-        Mode::Modal(m) => match code {
-            KeyCode::Esc => app.mode = Mode::Normal,
-            KeyCode::Enter => app.submit_modal()?,
-            KeyCode::Tab | KeyCode::Down => m.focus = (m.focus + 1) % 3,
-            KeyCode::BackTab | KeyCode::Up => m.focus = (m.focus + 2) % 3,
-            KeyCode::Backspace => {
-                m.error = None;
-                current_buf(m).pop();
+        Mode::Modal(m) => {
+            let field_count = match m.kind {
+                ModalKind::AddEdit => 3,
+                ModalKind::Start | ModalKind::End => 1,
+            };
+            match code {
+                KeyCode::Esc => app.mode = Mode::Normal,
+                KeyCode::Enter => app.submit_modal()?,
+                KeyCode::Tab | KeyCode::Down => m.focus = (m.focus + 1) % field_count,
+                KeyCode::BackTab | KeyCode::Up => {
+                    m.focus = (m.focus + field_count - 1) % field_count;
+                }
+                KeyCode::Backspace => {
+                    m.error = None;
+                    current_buf(m).pop();
+                }
+                KeyCode::Char(c) => {
+                    m.error = None;
+                    current_buf(m).push(c);
+                }
+                _ => {}
             }
-            KeyCode::Char(c) => {
-                m.error = None;
-                current_buf(m).push(c);
-            }
-            _ => {}
-        },
+        }
     }
     Ok(())
 }
 
 fn current_buf(m: &mut ModalState) -> &mut String {
-    match m.focus {
-        0 => &mut m.date_buf,
-        1 => &mut m.start_buf,
-        _ => &mut m.end_buf,
+    match m.kind {
+        ModalKind::AddEdit => match m.focus {
+            0 => &mut m.date_buf,
+            1 => &mut m.start_buf,
+            _ => &mut m.end_buf,
+        },
+        ModalKind::Start | ModalKind::End => &mut m.time_buf,
     }
 }
 
@@ -392,9 +608,9 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let target_today = calc::daily_target_minutes(&app.config, today);
-    let line = if target_today == 0 {
+    let mut spans = if target_today == 0 {
         let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today));
-        Line::from(vec![
+        vec![
             Span::styled(
                 "No target today — logged ",
                 Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
@@ -403,11 +619,11 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 calc::format_hm(worked),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-        ])
+        ]
     } else {
         let now = Local::now().time();
         let leave = calc::leave_time(&app.entries, &app.config, today, now);
-        Line::from(vec![
+        vec![
             Span::styled(
                 "Leave at ",
                 Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
@@ -416,10 +632,19 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 leave.format("%H:%M").to_string(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
-        ])
+        ]
     };
+    if let Some(open) = calc::open_entry(&app.entries)
+        && open.date == today
+    {
+        spans.push(Span::styled("  ·  open since ", Style::default().fg(LABEL)));
+        spans.push(Span::styled(
+            open.start.format("%H:%M").to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    }
     let block = gray_block(format!(" {} ({}) ", today, today.format("%A")));
-    let p = Paragraph::new(line)
+    let p = Paragraph::new(Line::from(spans))
         .alignment(Alignment::Center)
         .block(block);
     f.render_widget(p, area);
@@ -528,12 +753,17 @@ fn today_items(app: &App) -> Vec<ListItem<'static>> {
 
     let mut items: Vec<ListItem> = Vec::new();
     for e in &entries {
+        let range_style = if e.end.is_none() {
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("#{:<4} ", e.id), Style::default().fg(MUTED)),
             Span::styled(format!("{} ", e.date), Style::default().fg(LABEL)),
             Span::styled(
-                format!("{}-{}", e.start.format("%H:%M"), e.end.format("%H:%M")),
-                Style::default().add_modifier(Modifier::BOLD),
+                format!("{}-{}", e.start.format("%H:%M"), calc::format_end(e.end)),
+                range_style,
             ),
         ])));
     }
@@ -587,7 +817,7 @@ fn day_window(entries: &[TimeEntry], week_start: NaiveDate) -> (NaiveTime, Naive
         .min(default_start);
     let end = week_entries
         .iter()
-        .map(|e| e.end)
+        .filter_map(|e| e.end)
         .max()
         .unwrap_or(default_end)
         .max(default_end);
@@ -611,7 +841,9 @@ fn day_bar(
         .map(|c| {
             let offset = (c as i64 * total_minutes) / width as i64;
             let t = window_start + chrono::Duration::minutes(offset);
-            entries.iter().any(|e| e.start <= t && t < e.end)
+            entries
+                .iter()
+                .any(|e| e.end.is_some_and(|end| e.start <= t && t < end))
         })
         .collect()
 }
@@ -639,16 +871,25 @@ fn bar_spans(cells: &[bool]) -> Vec<Span<'static>> {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let p = match &app.status {
-        Some(s) => Paragraph::new(Span::styled(
-            s.clone(),
-            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
-        )),
+        Some((kind, s)) => {
+            let color = if *kind == StatusKind::Error {
+                DANGER
+            } else {
+                SUCCESS
+            };
+            Paragraph::new(Span::styled(
+                s.clone(),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ))
+        }
         None => {
             let hint = match app.view {
                 View::Today => {
-                    "q quit | a add | e edit | d delete | j/k move | Tab view | r reload"
+                    "q quit | a add | s start | f finish | e edit | d delete | j/k move | Tab view | r reload"
                 }
-                View::Week => "q quit | a add | j/k move | Tab view | r reload",
+                View::Week => {
+                    "q quit | a add | s start | f finish | j/k move | Tab view | r reload"
+                }
             };
             Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
         }
@@ -667,7 +908,30 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     }
 }
 
+fn field_line(label: &str, value: &str, focused: bool) -> Line<'static> {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(LABEL)),
+        Span::styled(value.to_string(), style),
+    ])
+}
+
 fn draw_modal(f: &mut Frame, m: &ModalState) {
+    match m.kind {
+        ModalKind::AddEdit => draw_add_edit_modal(f, m),
+        ModalKind::Start => draw_time_modal(f, m, " Start block ", "Start time (HH:MM)"),
+        ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time (HH:MM)"),
+    }
+}
+
+fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
     let area = centered_rect(50, 9, f.area());
     f.render_widget(Clear, area);
 
@@ -691,23 +955,8 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
         ])
         .split(inner);
 
-    let field = |label: &str, value: &str, focused: bool| {
-        let style = if focused {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Line::from(vec![
-            Span::styled(format!("{label}: "), Style::default().fg(LABEL)),
-            Span::styled(value.to_string(), style),
-        ])
-    };
-
     f.render_widget(
-        Paragraph::new(field(
+        Paragraph::new(field_line(
             "Date (YYYY-MM-DD/today/yesterday)",
             &m.date_buf,
             m.focus == 0,
@@ -715,11 +964,11 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
         chunks[0],
     );
     f.render_widget(
-        Paragraph::new(field("Start (HH:MM)", &m.start_buf, m.focus == 1)),
+        Paragraph::new(field_line("Start (HH:MM)", &m.start_buf, m.focus == 1)),
         chunks[1],
     );
     f.render_widget(
-        Paragraph::new(field("End   (HH:MM)", &m.end_buf, m.focus == 2)),
+        Paragraph::new(field_line("End   (HH:MM)", &m.end_buf, m.focus == 2)),
         chunks[2],
     );
     if let Some(err) = &m.error {
@@ -737,6 +986,45 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
             Style::default().fg(MUTED),
         )),
         chunks[4],
+    );
+}
+
+fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
+    let area = centered_rect(46, 7, f.area());
+    f.render_widget(Clear, area);
+
+    let block = gray_block(title.to_string());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(field_line(label, &m.time_buf, true)),
+        chunks[0],
+    );
+    if let Some(err) = &m.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                err.as_str(),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )),
+            chunks[1],
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Enter: save | Esc: cancel",
+            Style::default().fg(MUTED),
+        )),
+        chunks[2],
     );
 }
 

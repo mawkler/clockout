@@ -30,6 +30,16 @@ pub enum Command {
         #[arg(long, conflicts_with = "day")]
         date: Option<NaiveDate>,
     },
+    /// Start an open-ended block, e.g. `time start 12:35` (default: now)
+    Start {
+        time: Option<String>,
+        #[arg(long, conflicts_with = "date")]
+        day: Option<String>,
+        #[arg(long, conflicts_with = "day")]
+        date: Option<NaiveDate>,
+    },
+    /// Close the open block started with `time start` (default: now)
+    End { time: Option<String> },
     /// Print a one-shot plain-text summary
     Status,
     /// Launch the interactive dashboard (also the default with no subcommand)
@@ -70,6 +80,8 @@ pub fn run(command: Command) -> anyhow::Result<()> {
     let today = Local::now().date_naive();
     match command {
         Command::Log { range, day, date } => cmd_log(range, day, date, today),
+        Command::Start { time, day, date } => cmd_start(time, day, date, today),
+        Command::End { time } => cmd_end(time),
         Command::Status => cmd_status(today),
         Command::Tui => crate::tui::run(),
         Command::List { all } => cmd_list(all, today),
@@ -88,11 +100,19 @@ fn cmd_log(
     let (start, end) = parse::parse_range(&range).map_err(|e| anyhow::anyhow!(e))?;
 
     let mut data = storage::load_entries()?;
+    if let Some(open) = calc::open_entry(&data.entries) {
+        anyhow::bail!(
+            "open block #{} ({} {}-…) needs `time end` first",
+            open.id,
+            open.date,
+            open.start.format("%H:%M")
+        );
+    }
     let candidate = TimeEntry {
         id: data.next_id,
         date: entry_date,
         start,
-        end,
+        end: Some(end),
     };
     if let Some(conflict) = data
         .entries
@@ -105,7 +125,7 @@ fn cmd_log(
             end.format("%H:%M"),
             conflict.id,
             conflict.start.format("%H:%M"),
-            conflict.end.format("%H:%M"),
+            calc::format_end(conflict.end),
         );
     }
 
@@ -115,6 +135,115 @@ fn cmd_log(
     println!(
         "logged #{}: {} {}-{}",
         candidate.id,
+        entry_date,
+        start.format("%H:%M"),
+        end.format("%H:%M")
+    );
+    Ok(())
+}
+
+fn cmd_start(
+    time: Option<String>,
+    day: Option<String>,
+    date: Option<NaiveDate>,
+    today: NaiveDate,
+) -> anyhow::Result<()> {
+    let mut data = storage::load_entries()?;
+    if let Some(open) = calc::open_entry(&data.entries) {
+        anyhow::bail!(
+            "already have an open block #{} ({} {}-…) - run `time end` first",
+            open.id,
+            open.date,
+            open.start.format("%H:%M")
+        );
+    }
+
+    let entry_date = resolve_date(&day, &date, today).map_err(|e| anyhow::anyhow!(e))?;
+    let start = match time {
+        Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
+        None => Local::now().time(),
+    };
+    let candidate = TimeEntry {
+        id: data.next_id,
+        date: entry_date,
+        start,
+        end: None,
+    };
+    if let Some(conflict) = data
+        .entries
+        .iter()
+        .find(|e| e.date == entry_date && calc::overlaps(e, &candidate))
+    {
+        anyhow::bail!(
+            "start {} overlaps existing entry #{} ({}-{})",
+            start.format("%H:%M"),
+            conflict.id,
+            conflict.start.format("%H:%M"),
+            calc::format_end(conflict.end),
+        );
+    }
+
+    data.next_id += 1;
+    data.entries.push(candidate.clone());
+    storage::save_entries(&data)?;
+    println!(
+        "started #{}: {} {}-…",
+        candidate.id,
+        entry_date,
+        start.format("%H:%M")
+    );
+    Ok(())
+}
+
+fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
+    let mut data = storage::load_entries()?;
+    let idx = data
+        .entries
+        .iter()
+        .position(|e| e.end.is_none())
+        .ok_or_else(|| anyhow::anyhow!("no open block - run `time start` first"))?;
+
+    let end = match time {
+        Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
+        None => Local::now().time(),
+    };
+    let (id, entry_date, start) = (
+        data.entries[idx].id,
+        data.entries[idx].date,
+        data.entries[idx].start,
+    );
+    if start >= end {
+        anyhow::bail!(
+            "end {} must be after start {}",
+            end.format("%H:%M"),
+            start.format("%H:%M")
+        );
+    }
+    let candidate = TimeEntry {
+        id,
+        date: entry_date,
+        start,
+        end: Some(end),
+    };
+    if let Some(conflict) = data
+        .entries
+        .iter()
+        .find(|e| e.id != id && e.date == entry_date && calc::overlaps(e, &candidate))
+    {
+        anyhow::bail!(
+            "end {} overlaps existing entry #{} ({}-{})",
+            end.format("%H:%M"),
+            conflict.id,
+            conflict.start.format("%H:%M"),
+            calc::format_end(conflict.end),
+        );
+    }
+
+    data.entries[idx].end = Some(end);
+    storage::save_entries(&data)?;
+    println!(
+        "ended #{}: {} {}-{}",
+        id,
         entry_date,
         start.format("%H:%M"),
         end.format("%H:%M")
@@ -164,6 +293,13 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
             clear_debt_by.format("%H:%M")
         );
     }
+    if let Some(open) = calc::open_entry(&data.entries) {
+        println!(
+            "Open block: {} started {} (`time end` to close)",
+            open.date,
+            open.start.format("%H:%M")
+        );
+    }
     Ok(())
 }
 
@@ -186,7 +322,7 @@ fn cmd_list(all: bool, today: NaiveDate) -> anyhow::Result<()> {
             e.id,
             e.date,
             e.start.format("%H:%M"),
-            e.end.format("%H:%M")
+            calc::format_end(e.end)
         );
     }
     Ok(())
@@ -207,7 +343,7 @@ fn cmd_edit(id: u64, range: Option<String>, date: Option<NaiveDate>) -> anyhow::
     if let Some(range) = range {
         let (start, end) = parse::parse_range(&range).map_err(|e| anyhow::anyhow!(e))?;
         updated.start = start;
-        updated.end = end;
+        updated.end = Some(end);
     }
 
     if let Some(conflict) = data
@@ -218,10 +354,10 @@ fn cmd_edit(id: u64, range: Option<String>, date: Option<NaiveDate>) -> anyhow::
         anyhow::bail!(
             "range {}-{} overlaps existing entry #{} ({}-{})",
             updated.start.format("%H:%M"),
-            updated.end.format("%H:%M"),
+            calc::format_end(updated.end),
             conflict.id,
             conflict.start.format("%H:%M"),
-            conflict.end.format("%H:%M"),
+            calc::format_end(conflict.end),
         );
     }
 
@@ -232,7 +368,7 @@ fn cmd_edit(id: u64, range: Option<String>, date: Option<NaiveDate>) -> anyhow::
         updated.id,
         updated.date,
         updated.start.format("%H:%M"),
-        updated.end.format("%H:%M")
+        calc::format_end(updated.end)
     );
     Ok(())
 }

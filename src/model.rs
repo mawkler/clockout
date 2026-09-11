@@ -7,8 +7,14 @@ pub struct TimeEntry {
     pub date: NaiveDate,
     #[serde(with = "hhmm_time")]
     pub start: NaiveTime,
-    #[serde(with = "hhmm_time")]
-    pub end: NaiveTime,
+    /// None means the block was started but not yet finished (`time start`
+    /// without a matching `time end`).
+    #[serde(
+        with = "hhmm_time_opt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end: Option<NaiveTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,5 +71,29 @@ mod hhmm_time {
     {
         let s = String::deserialize(deserializer)?;
         NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom)
+    }
+}
+
+mod hhmm_time_opt {
+    use chrono::NaiveTime;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(time: &Option<NaiveTime>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match time {
+            Some(t) => serializer.serialize_str(&t.format("%H:%M").to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<NaiveTime>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        opt.map(|s| NaiveTime::parse_from_str(&s, "%H:%M").map_err(serde::de::Error::custom))
+            .transpose()
     }
 }
