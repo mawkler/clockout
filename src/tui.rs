@@ -853,9 +853,10 @@ enum Cell {
 }
 
 /// Rasterizes a day's entries across `width` columns spanning
-/// [window_start, window_end). An open block (no end yet) fills from its
-/// start through `now` if `day` is `today`, or through the window's end
-/// otherwise (we have no better bound for a block left open on a past day).
+/// [window_start, window_end). An open block (no end yet) gets a single
+/// marker column at its current leading edge - `now` if `day` is `today`, or
+/// the window's end otherwise (no better bound for a block left open on a
+/// past day) - rather than filling its whole (still-growing) span.
 fn day_bar(
     entries: &[&TimeEntry],
     window_start: NaiveTime,
@@ -868,25 +869,32 @@ fn day_bar(
     if width == 0 {
         return Vec::new();
     }
-    let open = entries.iter().find(|e| e.end.is_none());
-    let open_end = if day == today { now } else { window_end };
     let total_minutes = (window_end - window_start).num_minutes().max(1);
-    (0..width)
+    let mut cells: Vec<Cell> = (0..width)
         .map(|c| {
             let offset = (c as i64 * total_minutes) / width as i64;
             let t = window_start + chrono::Duration::minutes(offset);
             let worked = entries
                 .iter()
                 .any(|e| e.end.is_some_and(|end| e.start <= t && t < end));
-            if worked {
-                Cell::Worked
-            } else if open.is_some_and(|o| o.start <= t && t < open_end) {
-                Cell::Open
-            } else {
-                Cell::Empty
-            }
+            if worked { Cell::Worked } else { Cell::Empty }
         })
-        .collect()
+        .collect();
+
+    if let Some(open) = entries.iter().find(|e| e.end.is_none()) {
+        let open_end = if day == today { now } else { window_end };
+        if open.start < open_end {
+            let offset = (open_end - window_start)
+                .num_minutes()
+                .clamp(0, total_minutes);
+            let col = ((offset * width as i64) / total_minutes) as usize;
+            let col = col.min(width - 1);
+            if cells[col] != Cell::Worked {
+                cells[col] = Cell::Open;
+            }
+        }
+    }
+    cells
 }
 
 fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
