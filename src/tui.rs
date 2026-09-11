@@ -2,7 +2,7 @@ use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, NaiveTime};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -21,8 +21,8 @@ use crate::parse;
 use crate::storage;
 
 const BORDER: Color = Color::DarkGray;
-const MUTED: Color = Color::DarkGray;
-const LABEL: Color = Color::Gray;
+const MUTED: Color = Color::Gray;
+const LABEL: Color = Color::White;
 const ACCENT: Color = Color::Cyan;
 const DANGER: Color = Color::Red;
 const SUCCESS: Color = Color::Green;
@@ -83,7 +83,7 @@ impl App {
     fn reload(&mut self) -> Result<()> {
         self.entries = storage::load_entries()?.entries;
         self.config = storage::load_config()?;
-        let len = self.visible().len();
+        let len = self.visible_len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
@@ -109,12 +109,34 @@ impl App {
         v
     }
 
+    /// Distinct dates with logged entries in the current week, ascending.
+    /// Used for the week view, which shows one summary row per day.
+    fn visible_days(&self) -> Vec<NaiveDate> {
+        let (week_start, _) = calc::week_bounds(self.today());
+        let mut dates: Vec<NaiveDate> = calc::entries_in_week(&self.entries, week_start)
+            .iter()
+            .map(|e| e.date)
+            .collect();
+        dates.sort();
+        dates.dedup();
+        dates
+    }
+
+    /// Number of selectable rows for the current view: entries in Today
+    /// view, day-summary rows in Week view.
+    fn visible_len(&self) -> usize {
+        match self.view {
+            View::Today => self.visible().len(),
+            View::Week => self.visible_days().len(),
+        }
+    }
+
     fn selected_entry(&self) -> Option<TimeEntry> {
         self.visible().get(self.selected).map(|e| (*e).clone())
     }
 
     fn move_selection(&mut self, delta: i32) {
-        let len = self.visible().len();
+        let len = self.visible_len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -292,8 +314,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         Mode::Normal => match code {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('a') => app.open_add(),
-            KeyCode::Char('e') => app.open_edit(),
-            KeyCode::Char('d') => app.request_delete(),
+            KeyCode::Char('e') if app.view == View::Today => app.open_edit(),
+            KeyCode::Char('d') if app.view == View::Today => app.request_delete(),
             KeyCode::Char('r') => app.reload()?,
             KeyCode::Tab => {
                 app.view = if app.view == View::Today {
@@ -371,7 +393,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let line = if target_today == 0 {
         let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today));
         Line::from(vec![
-            Span::styled("No target today — logged ", Style::default().fg(LABEL)),
+            Span::styled(
+                "No target today — logged ",
+                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 calc::format_hm(worked),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -381,7 +406,10 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         let now = Local::now().time();
         let leave = calc::leave_time(&app.entries, &app.config, today, now);
         Line::from(vec![
-            Span::styled("Leave at ", Style::default().fg(LABEL)),
+            Span::styled(
+                "Leave at ",
+                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 leave.format("%H:%M").to_string(),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -441,11 +469,47 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
         View::Today => " Today (Tab: week view) ",
         View::Week => " This week (Tab: today view) ",
     };
-    let visible = app.visible();
-    let gaps = calc::today_gaps(&app.entries, app.today());
+    // Matches Block::inner() for a plain Borders::ALL block: 1 column each side.
+    let inner_width = area.width.saturating_sub(2);
+
+    let items: Vec<ListItem> = match app.view {
+        View::Today => today_items(app),
+        View::Week => week_items(app, inner_width),
+    };
+    let no_entries = items.is_empty();
+    let items = if no_entries {
+        vec![ListItem::new(Span::styled(
+            "no entries",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        items
+    };
+
+    let mut state = ListState::default();
+    let len = app.visible_len();
+    if len > 0 {
+        state.select(Some(app.selected.min(len - 1)));
+    }
+
+    // Reversed (not a hardcoded fg/bg) so each span's own color still comes
+    // through on the selected row - important for the week view's bar, whose
+    // filled/empty cells would otherwise become indistinguishable.
+    let list = List::new(items).block(gray_block(title)).highlight_style(
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+fn today_items(app: &App) -> Vec<ListItem<'static>> {
+    let today = app.today();
+    let entries = calc::entries_on(&app.entries, today);
+    let gaps = calc::today_gaps(&app.entries, today);
 
     let mut items: Vec<ListItem> = Vec::new();
-    for e in &visible {
+    for e in &entries {
         items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("#{:<4} ", e.id), Style::default().fg(MUTED)),
             Span::styled(format!("{} ", e.date), Style::default().fg(LABEL)),
@@ -455,37 +519,104 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
             ),
         ])));
     }
-    if app.view == View::Today {
-        for (start, end) in gaps {
-            items.push(ListItem::new(Span::styled(
-                format!(
-                    "      {}-{} (gap/break)",
-                    start.format("%H:%M"),
-                    end.format("%H:%M")
-                ),
-                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-            )));
-        }
-    }
-    if items.is_empty() {
+    for (start, end) in gaps {
         items.push(ListItem::new(Span::styled(
-            "no entries",
-            Style::default().fg(MUTED),
+            format!(
+                "      {}-{} (gap/break)",
+                start.format("%H:%M"),
+                end.format("%H:%M")
+            ),
+            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )));
     }
+    items
+}
 
-    let mut state = ListState::default();
-    if !visible.is_empty() {
-        state.select(Some(app.selected.min(visible.len() - 1)));
+/// One summary row per worked day: weekday name, total hours, and a bar
+/// showing where in the day the logged time falls (all rows share the same
+/// time-of-day scale so they're visually comparable).
+fn week_items(app: &App, inner_width: u16) -> Vec<ListItem<'static>> {
+    let (week_start, _) = calc::week_bounds(app.today());
+    let days = app.visible_days();
+    let (window_start, window_end) = day_window(&app.entries, week_start);
+
+    days.into_iter()
+        .map(|day| {
+            let day_entries = calc::entries_on(&app.entries, day);
+            let total = calc::worked_minutes(&day_entries);
+            let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
+            let bar_width = inner_width.saturating_sub(prefix.chars().count() as u16);
+            let cells = day_bar(&day_entries, window_start, window_end, bar_width as usize);
+
+            let mut spans = vec![Span::styled(prefix, Style::default().fg(LABEL))];
+            spans.extend(bar_spans(&cells));
+            ListItem::new(Line::from(spans))
+        })
+        .collect()
+}
+
+/// The shared time-of-day window used to draw week-view bars: a sensible
+/// default workday, widened to cover any entry that falls outside it.
+fn day_window(entries: &[TimeEntry], week_start: NaiveDate) -> (NaiveTime, NaiveTime) {
+    let default_start = NaiveTime::from_hms_opt(6, 0, 0).unwrap();
+    let default_end = NaiveTime::from_hms_opt(20, 0, 0).unwrap();
+    let week_entries = calc::entries_in_week(entries, week_start);
+    let start = week_entries
+        .iter()
+        .map(|e| e.start)
+        .min()
+        .unwrap_or(default_start)
+        .min(default_start);
+    let end = week_entries
+        .iter()
+        .map(|e| e.end)
+        .max()
+        .unwrap_or(default_end)
+        .max(default_end);
+    (start, end)
+}
+
+/// Rasterizes a day's entries across `width` columns spanning
+/// [window_start, window_end): true where a column's time falls inside a
+/// logged entry.
+fn day_bar(
+    entries: &[&TimeEntry],
+    window_start: NaiveTime,
+    window_end: NaiveTime,
+    width: usize,
+) -> Vec<bool> {
+    if width == 0 {
+        return Vec::new();
     }
+    let total_minutes = (window_end - window_start).num_minutes().max(1);
+    (0..width)
+        .map(|c| {
+            let offset = (c as i64 * total_minutes) / width as i64;
+            let t = window_start + chrono::Duration::minutes(offset);
+            entries.iter().any(|e| e.start <= t && t < e.end)
+        })
+        .collect()
+}
 
-    let list = List::new(items).block(gray_block(title)).highlight_style(
-        Style::default()
-            .fg(Color::Black)
-            .bg(ACCENT)
-            .add_modifier(Modifier::BOLD),
-    );
-    f.render_stateful_widget(list, area, &mut state);
+fn bar_spans(cells: &[bool]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < cells.len() {
+        let value = cells[i];
+        let mut j = i + 1;
+        while j < cells.len() && cells[j] == value {
+            j += 1;
+        }
+        let ch = if value { '█' } else { '·' };
+        let style = if value {
+            Style::default().fg(ACCENT)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        spans.push(Span::styled(ch.to_string().repeat(j - i), style));
+        i = j;
+    }
+    spans
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
@@ -494,10 +625,15 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             s.clone(),
             Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
         )),
-        None => Paragraph::new(Span::styled(
-            "q quit | a add | e edit | d delete | j/k move | Tab view | r reload",
-            Style::default().fg(MUTED),
-        )),
+        None => {
+            let hint = match app.view {
+                View::Today => {
+                    "q quit | a add | e edit | d delete | j/k move | Tab view | r reload"
+                }
+                View::Week => "q quit | a add | j/k move | Tab view | r reload",
+            };
+            Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
+        }
     };
     f.render_widget(p, area);
 }
