@@ -365,18 +365,20 @@ fn current_buf(m: &mut ModalState) -> &mut String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    let debt = calc::time_debt_minutes(&app.entries, &app.config, app.today());
+    let stats_height = if debt > 0 { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(4),
+            Constraint::Length(stats_height),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
         .split(f.area());
 
     draw_header(f, app, chunks[0]);
-    draw_stats(f, app, chunks[1]);
+    draw_stats(f, app, chunks[1], debt);
     draw_entries(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
 
@@ -423,7 +425,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
-fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
+fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
     let today = app.today();
     let worked_today = calc::worked_minutes(&calc::entries_on(&app.entries, today));
     let target_today = calc::daily_target_minutes(&app.config, today);
@@ -465,7 +467,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
         Line::from(spans)
     };
 
-    let lines = vec![
+    let mut lines = vec![
         stat_line(
             "Today:     ",
             worked_today,
@@ -483,6 +485,16 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
             Some(clear_debt_by),
         ),
     ];
+    if debt > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("Time debt: ", label),
+            Span::styled(
+                calc::format_hm(debt),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" (shortfall from earlier this week)", label),
+        ]));
+    }
     let p = Paragraph::new(lines).block(gray_block(""));
     f.render_widget(p, area);
 }

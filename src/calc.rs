@@ -50,6 +50,24 @@ pub fn minutes_left_week(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) 
     (weekly_goal_minutes(cfg) - worked).max(0)
 }
 
+/// Accumulated shortfall from days that have already fully elapsed this week
+/// (i.e. before `today`), assuming each day was expected to hit its own
+/// daily target. A day worked past its target offsets shortfall from another
+/// day net; the total is clamped to 0 (never negative - being ahead isn't
+/// "negative debt"). Today itself is excluded: its own remaining time is
+/// already covered by `minutes_left_today` / `leave_time`.
+pub fn time_debt_minutes(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) -> i64 {
+    let (week_start, _) = week_bounds(today);
+    let mut debt = 0;
+    let mut day = week_start;
+    while day < today {
+        let worked = worked_minutes(&entries_on(entries, day));
+        debt += daily_target_minutes(cfg, day) - worked;
+        day += Duration::days(1);
+    }
+    debt.max(0)
+}
+
 /// Gaps between consecutive logged entries for `day`, sorted by start time.
 /// Purely descriptive - worked-time math never needs this, since minutes not
 /// covered by any logged range are simply absent from the sum already.
@@ -222,6 +240,68 @@ mod tests {
         assert_eq!(week_bounds(monday), (monday, sunday));
         assert_eq!(week_bounds(sunday), (monday, sunday));
         assert_eq!(week_bounds(midweek), (monday, sunday));
+    }
+
+    #[test]
+    fn time_debt_zero_on_first_day_of_week() {
+        let c = cfg(40.0, 30);
+        let monday = date(2026, 9, 7);
+        assert_eq!(time_debt_minutes(&[], &c, monday), 0);
+    }
+
+    #[test]
+    fn time_debt_sums_elapsed_shortfalls() {
+        let c = cfg(40.0, 30); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "13:30"), // Mon 5h30m, deficit 2h30m
+            entry(2, date(2026, 9, 8), "08:00", "14:20"), // Tue 6h20m, deficit 1h40m
+            entry(3, date(2026, 9, 9), "08:00", "14:45"), // Wed 6h45m, deficit 1h15m
+            entry(4, date(2026, 9, 10), "08:00", "13:10"), // Thu 5h10m, deficit 2h50m
+        ];
+        let friday = date(2026, 9, 11);
+        // Only Mon-Thu have elapsed; Friday itself is excluded.
+        assert_eq!(
+            time_debt_minutes(&entries, &c, friday),
+            150 + 100 + 75 + 170
+        );
+    }
+
+    #[test]
+    fn time_debt_nets_surplus_against_shortfall() {
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "16:00"), // Mon 8h, surplus 0
+            entry(2, date(2026, 9, 8), "08:00", "13:00"), // Tue 5h, deficit 3h
+        ];
+        let wednesday = date(2026, 9, 9);
+        assert_eq!(time_debt_minutes(&entries, &c, wednesday), 180);
+    }
+
+    #[test]
+    fn time_debt_clamps_to_zero_when_net_ahead() {
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "19:40"), // Mon 11h40m, surplus 3h40m
+            entry(2, date(2026, 9, 8), "08:00", "14:40"), // Tue 6h40m, deficit 1h20m
+        ];
+        let wednesday = date(2026, 9, 9);
+        assert_eq!(time_debt_minutes(&entries, &c, wednesday), 0);
+    }
+
+    #[test]
+    fn time_debt_weekend_work_offsets_weekday_shortfall() {
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "14:20"), // Mon 6h20m, deficit 1h40m
+            entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
+            entry(3, date(2026, 9, 9), "08:00", "16:00"), // Wed 8h, on target
+            entry(4, date(2026, 9, 10), "08:00", "16:00"), // Thu 8h, on target
+            entry(5, date(2026, 9, 11), "08:00", "16:00"), // Fri 8h, on target
+            entry(6, date(2026, 9, 12), "09:00", "10:00"), // Sat 1h (target 0), offsets debt
+        ];
+        // Sunday: the whole Mon-Sat week has elapsed.
+        let sunday = date(2026, 9, 13);
+        assert_eq!(time_debt_minutes(&entries, &c, sunday), 100 - 60);
     }
 
     #[test]

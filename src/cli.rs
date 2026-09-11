@@ -160,6 +160,13 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         "Clear time debt by: {} (pay off the whole week today)",
         clear_debt_by.format("%H:%M")
     );
+    let debt = calc::time_debt_minutes(&data.entries, &cfg, today);
+    if debt > 0 {
+        println!(
+            "Time debt: {} (shortfall from earlier this week)",
+            calc::format_hm(debt)
+        );
+    }
     Ok(())
 }
 
