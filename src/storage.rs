@@ -7,7 +7,7 @@ use directories::ProjectDirs;
 use crate::model::{Config, EntriesFile};
 
 fn project_dirs() -> Result<ProjectDirs> {
-    ProjectDirs::from("", "", "time").context("could not determine home directory")
+    ProjectDirs::from("", "", "clockout").context("could not determine home directory")
 }
 
 pub fn config_path() -> Result<PathBuf> {

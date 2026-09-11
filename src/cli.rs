@@ -8,7 +8,7 @@ use crate::storage;
 
 #[derive(Parser)]
 #[command(
-    name = "time",
+    name = "clockout",
     version,
     about = "Track weekly work hours against a goal"
 )]
@@ -19,7 +19,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Log a worked time range, e.g. `time log 8:00-12:00`
+    /// Log a worked time range, e.g. `clockout log 8:00-12:00`
     Log {
         /// Time range, e.g. "8:00-12:00"
         range: String,
@@ -30,7 +30,7 @@ pub enum Command {
         #[arg(long, conflicts_with = "day")]
         date: Option<NaiveDate>,
     },
-    /// Start an open-ended block, e.g. `time start 12:35` (default: now)
+    /// Start an open-ended block, e.g. `clockout start 12:35` (default: now)
     Start {
         time: Option<String>,
         #[arg(long, conflicts_with = "date")]
@@ -38,7 +38,7 @@ pub enum Command {
         #[arg(long, conflicts_with = "day")]
         date: Option<NaiveDate>,
     },
-    /// Close the open block started with `time start` (default: now)
+    /// Close the open block started with `clockout start` (default: now)
     End { time: Option<String> },
     /// Print a one-shot plain-text summary
     Status,
@@ -102,7 +102,7 @@ fn cmd_log(
     let mut data = storage::load_entries()?;
     if let Some(open) = calc::open_entry(&data.entries) {
         anyhow::bail!(
-            "open block #{} ({} {}-…) needs `time end` first",
+            "open block #{} ({} {}-…) needs `clockout end` first",
             open.id,
             open.date,
             open.start.format("%H:%M")
@@ -151,7 +151,7 @@ fn cmd_start(
     let mut data = storage::load_entries()?;
     if let Some(open) = calc::open_entry(&data.entries) {
         anyhow::bail!(
-            "already have an open block #{} ({} {}-…) - run `time end` first",
+            "already have an open block #{} ({} {}-…) - run `clockout end` first",
             open.id,
             open.date,
             open.start.format("%H:%M")
@@ -201,7 +201,7 @@ fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
         .entries
         .iter()
         .position(|e| e.end.is_none())
-        .ok_or_else(|| anyhow::anyhow!("no open block - run `time start` first"))?;
+        .ok_or_else(|| anyhow::anyhow!("no open block - run `clockout start` first"))?;
 
     let end = match time {
         Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
@@ -299,7 +299,7 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     }
     if let Some(open) = calc::open_entry(&data.entries) {
         println!(
-            "Open block: {} started {} (`time end` to close)",
+            "Open block: {} started {} (`clockout end` to close)",
             open.date,
             open.start.format("%H:%M")
         );

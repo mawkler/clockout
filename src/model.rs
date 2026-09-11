@@ -7,8 +7,8 @@ pub struct TimeEntry {
     pub date: NaiveDate,
     #[serde(with = "hhmm_time")]
     pub start: NaiveTime,
-    /// None means the block was started but not yet finished (`time start`
-    /// without a matching `time end`).
+    /// None means the block was started but not yet finished (`clockout
+    /// start` without a matching `clockout end`).
     #[serde(
         with = "hhmm_time_opt",
         default,

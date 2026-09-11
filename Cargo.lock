@@ -252,6 +252,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "clockout"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "crossterm",
+ "directories",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1266,7 +1281,7 @@ dependencies = [
  "ratatui-core",
  "serde",
  "strum",
- "time 0.3.55",
+ "time",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -1664,21 +1679,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
-]
-
-[[package]]
-name = "time"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "crossterm",
- "directories",
- "ratatui",
- "serde",
- "serde_json",
- "toml",
 ]
 
 [[package]]

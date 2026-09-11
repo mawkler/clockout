@@ -22,8 +22,8 @@ pub fn entry_minutes(e: &TimeEntry, today: NaiveDate, now: NaiveTime) -> i64 {
     }
 }
 
-/// The first entry with no end time (a block started via `time start` that
-/// hasn't been closed with `time end` yet). At most one is expected to exist.
+/// The first entry with no end time (a block started via `clockout start` that
+/// hasn't been closed with `clockout end` yet). At most one is expected to exist.
 pub fn open_entry(entries: &[TimeEntry]) -> Option<&TimeEntry> {
     entries.iter().find(|e| e.end.is_none())
 }
@@ -428,7 +428,7 @@ mod tests {
         let now_early = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
         assert_eq!(time_debt_minutes(&entries, &c, friday, now_early), 150);
         // By 18:30, 10h30m elapsed - 2h30m surplus, exactly enough to clear
-        // the debt, without ever calling `time end`.
+        // the debt, without ever calling `clockout end`.
         let now_later = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
         assert_eq!(time_debt_minutes(&entries, &c, friday, now_later), 0);
     }
