@@ -2,24 +2,22 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
 use crate::model::{Config, TimeEntry};
 
-/// Minutes worked by this entry as of `now`. A closed entry counts its
-/// stored duration. An open entry (no end yet) counts from its start
-/// through `now` if it's today's entry - so live displays reflect an
-/// ongoing session as it happens, not just once it's closed - or through
-/// the end of its own day otherwise (a block left open on a past day: no
-/// better bound than that). Never negative.
+/// Minutes worked by this entry as of `now`. An entry never gets credit for
+/// time that hasn't happened yet: if it's today's entry and its end (stored,
+/// or - for a still-open entry - the implicit end of day) is later than
+/// `now`, only the portion up to `now` counts. A day-in-the-past entry
+/// always counts its full stored (or through-end-of-day, if open) duration,
+/// since `now` can't meaningfully bound a day that's already over. Never
+/// negative - a block that hasn't started yet as of `now` contributes 0.
 pub fn entry_minutes(e: &TimeEntry, today: NaiveDate, now: NaiveTime) -> i64 {
-    match e.end {
-        Some(end) => (end - e.start).num_minutes(),
-        None => {
-            let effective_now = if e.date == today {
-                now
-            } else {
-                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
-            };
-            (effective_now - e.start).num_minutes().max(0)
-        }
-    }
+    let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+    let raw_end = e.end.unwrap_or(end_of_day);
+    let effective_end = if e.date == today {
+        raw_end.min(now)
+    } else {
+        raw_end
+    };
+    (effective_end - e.start).num_minutes().max(0)
 }
 
 /// The first entry with no end time (a block started via `clockout start` that
@@ -239,8 +237,8 @@ mod tests {
 
     /// A `now` value for tests where only closed entries are involved, so
     /// the exact time truly doesn't matter.
-    fn midnight() -> NaiveTime {
-        NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+    fn end_of_day() -> NaiveTime {
+        NaiveTime::from_hms_opt(23, 59, 59).unwrap()
     }
 
     fn cfg(goal: f64, future_break: u32) -> Config {
@@ -255,7 +253,7 @@ mod tests {
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00"), entry(2, d, "13:00", "15:15")];
         let refs: Vec<&TimeEntry> = entries.iter().collect();
-        assert_eq!(worked_minutes(&refs, d, midnight()), 4 * 60 + 2 * 60 + 15);
+        assert_eq!(worked_minutes(&refs, d, end_of_day()), 4 * 60 + 2 * 60 + 15);
     }
 
     #[test]
@@ -281,7 +279,7 @@ mod tests {
         let c = cfg(40.0, 30);
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "18:00")]; // 10h worked, target 8h
-        assert_eq!(minutes_left_today(&entries, &c, d, midnight()), 0);
+        assert_eq!(minutes_left_today(&entries, &c, d, end_of_day()), 0);
     }
 
     #[test]
@@ -294,7 +292,7 @@ mod tests {
             entry(3, date(2026, 9, 14), "08:00", "16:00"), // next week, excluded
         ];
         assert_eq!(
-            minutes_left_week(&entries, &c, monday, midnight()),
+            minutes_left_week(&entries, &c, monday, end_of_day()),
             40 * 60 - 16 * 60
         );
     }
@@ -304,7 +302,7 @@ mod tests {
         let c = cfg(10.0, 30);
         let monday = date(2026, 9, 7);
         let entries = vec![entry(1, monday, "08:00", "18:00")]; // 10h worked, goal 10h
-        assert_eq!(minutes_left_week(&entries, &c, monday, midnight()), 0);
+        assert_eq!(minutes_left_week(&entries, &c, monday, end_of_day()), 0);
     }
 
     #[test]
@@ -321,7 +319,7 @@ mod tests {
     fn time_debt_zero_on_first_day_of_week() {
         let c = cfg(40.0, 30);
         let monday = date(2026, 9, 7);
-        assert_eq!(time_debt_minutes(&[], &c, monday, midnight()), 0);
+        assert_eq!(time_debt_minutes(&[], &c, monday, end_of_day()), 0);
     }
 
     #[test]
@@ -336,7 +334,7 @@ mod tests {
         let friday = date(2026, 9, 11);
         // Nothing worked yet today, so no surplus to offset the debt with.
         assert_eq!(
-            time_debt_minutes(&entries, &c, friday, midnight()),
+            time_debt_minutes(&entries, &c, friday, end_of_day()),
             150 + 100 + 75 + 170
         );
     }
@@ -349,7 +347,10 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "13:00"), // Tue 5h, deficit 3h
         ];
         let wednesday = date(2026, 9, 9);
-        assert_eq!(time_debt_minutes(&entries, &c, wednesday, midnight()), 180);
+        assert_eq!(
+            time_debt_minutes(&entries, &c, wednesday, end_of_day()),
+            180
+        );
     }
 
     #[test]
@@ -360,7 +361,7 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "14:40"), // Tue 6h40m, deficit 1h20m
         ];
         let wednesday = date(2026, 9, 9);
-        assert_eq!(time_debt_minutes(&entries, &c, wednesday, midnight()), 0);
+        assert_eq!(time_debt_minutes(&entries, &c, wednesday, end_of_day()), 0);
     }
 
     #[test]
@@ -377,7 +378,7 @@ mod tests {
         // Sunday: the whole Mon-Sat week has elapsed; nothing logged Sunday itself.
         let sunday = date(2026, 9, 13);
         assert_eq!(
-            time_debt_minutes(&entries, &c, sunday, midnight()),
+            time_debt_minutes(&entries, &c, sunday, end_of_day()),
             100 - 60
         );
     }
@@ -585,6 +586,54 @@ mod tests {
         let d = date(2026, 9, 11);
         let now = NaiveTime::parse_from_str("12:35", "%H:%M").unwrap();
         assert_eq!(entry_minutes(&open(1, d, "12:35"), d, now), 0);
+    }
+
+    #[test]
+    fn entry_minutes_closed_future_end_caps_at_now() {
+        let d = date(2026, 9, 11);
+        // Logged 12:35-17:00 in advance, but it's currently only 16:00: only
+        // the portion up to now counts, not the still-future 16:00-17:00.
+        let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
+        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 205); // 3h25m
+    }
+
+    #[test]
+    fn entry_minutes_closed_entirely_future_is_zero() {
+        let d = date(2026, 9, 11);
+        // A block logged for later today that hasn't started yet.
+        let now = NaiveTime::parse_from_str("10:00", "%H:%M").unwrap();
+        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 0);
+    }
+
+    #[test]
+    fn entry_minutes_past_day_future_looking_end_is_unaffected() {
+        // A closed entry on a day that's already over always counts in full,
+        // regardless of what `now` (today's clock) happens to be.
+        let yesterday = date(2026, 9, 10);
+        let today = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("08:00", "%H:%M").unwrap();
+        assert_eq!(
+            entry_minutes(&entry(1, yesterday, "12:35", "17:00"), today, now),
+            265 // 4h25m, the full stored duration
+        );
+    }
+
+    #[test]
+    fn leave_time_ignores_a_future_logged_end() {
+        let c = cfg(40.0, 0); // 8h/day target
+        let d = date(2026, 9, 11);
+        // A morning block plus an afternoon block logged in advance, end
+        // still in the future relative to `now`.
+        let entries = vec![
+            entry(1, d, "08:40", "12:00"), // 3h20m, fully past
+            entry(2, d, "12:35", "17:00"), // logged through 17:00...
+        ];
+        // ...but it's only 16:00 right now: only 12:35-16:00 (3h25m) of the
+        // second block counts, not the full 4h25m through 17:00.
+        let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
+        // worked so far: 3h20m + 3h25m = 6h45m; target 8h -> 1h15m left.
+        let leave = leave_time(&entries, &c, d, now);
+        assert_eq!(leave, NaiveTime::parse_from_str("17:15", "%H:%M").unwrap());
     }
 
     #[test]
