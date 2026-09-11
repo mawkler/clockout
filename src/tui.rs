@@ -900,7 +900,7 @@ fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
         }
         let (ch, style) = match value {
             Cell::Worked => ('█', Style::default().fg(ACCENT)),
-            Cell::Open => ('█', Style::default().fg(OPEN)),
+            Cell::Open => ('┃', Style::default().fg(OPEN)),
             Cell::Empty => ('·', Style::default().fg(MUTED)),
         };
         spans.push(Span::styled(ch.to_string().repeat(j - i), style));
