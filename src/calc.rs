@@ -2,12 +2,23 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
 use crate::model::{Config, TimeEntry};
 
-/// Minutes worked by this entry. An open entry (no end yet) contributes 0 -
-/// its duration isn't known until `time end` closes it.
-pub fn entry_minutes(e: &TimeEntry) -> i64 {
+/// Minutes worked by this entry as of `now`. A closed entry counts its
+/// stored duration. An open entry (no end yet) counts from its start
+/// through `now` if it's today's entry - so live displays reflect an
+/// ongoing session as it happens, not just once it's closed - or through
+/// the end of its own day otherwise (a block left open on a past day: no
+/// better bound than that). Never negative.
+pub fn entry_minutes(e: &TimeEntry, today: NaiveDate, now: NaiveTime) -> i64 {
     match e.end {
         Some(end) => (end - e.start).num_minutes(),
-        None => 0,
+        None => {
+            let effective_now = if e.date == today {
+                now
+            } else {
+                NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+            };
+            (effective_now - e.start).num_minutes().max(0)
+        }
     }
 }
 
@@ -54,37 +65,56 @@ pub fn entries_in_week(entries: &[TimeEntry], week_start: NaiveDate) -> Vec<&Tim
         .collect()
 }
 
-pub fn worked_minutes(entries: &[&TimeEntry]) -> i64 {
-    entries.iter().map(|e| entry_minutes(e)).sum()
+pub fn worked_minutes(entries: &[&TimeEntry], today: NaiveDate, now: NaiveTime) -> i64 {
+    entries.iter().map(|e| entry_minutes(e, today, now)).sum()
 }
 
-pub fn minutes_left_today(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) -> i64 {
-    let worked = worked_minutes(&entries_on(entries, today));
+pub fn minutes_left_today(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> i64 {
+    let worked = worked_minutes(&entries_on(entries, today), today, now);
     (daily_target_minutes(cfg, today) - worked).max(0)
 }
 
-pub fn minutes_left_week(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) -> i64 {
+pub fn minutes_left_week(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> i64 {
     let (week_start, _) = week_bounds(today);
-    let worked = worked_minutes(&entries_in_week(entries, week_start));
+    let worked = worked_minutes(&entries_in_week(entries, week_start), today, now);
     (weekly_goal_minutes(cfg) - worked).max(0)
 }
 
-/// Accumulated shortfall from days that have already fully elapsed this week
-/// (i.e. before `today`), assuming each day was expected to hit its own
-/// daily target. A day worked past its target offsets shortfall from another
-/// day net; the total is clamped to 0 (never negative - being ahead isn't
-/// "negative debt"). Today itself is excluded: its own remaining time is
-/// already covered by `minutes_left_today` / `leave_time`.
-pub fn time_debt_minutes(entries: &[TimeEntry], cfg: &Config, today: NaiveDate) -> i64 {
+/// Net shortfall from days that have already fully elapsed before `today`
+/// (each expected to hit its own daily target; a day worked past target
+/// offsets shortfall from another day net), reduced live by any surplus
+/// already worked today - so it can clear before the day is over, as soon
+/// as today's extra hours are enough to pay it off. Not yet having worked
+/// today's own target isn't held against you here (that's what
+/// `minutes_left_today` / `leave_time` already show); only hours worked
+/// *past* it count. Clamped to 0 (never negative).
+pub fn time_debt_minutes(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> i64 {
     let (week_start, _) = week_bounds(today);
-    let mut debt = 0;
+    let mut historical = 0;
     let mut day = week_start;
     while day < today {
-        let worked = worked_minutes(&entries_on(entries, day));
-        debt += daily_target_minutes(cfg, day) - worked;
+        let worked = worked_minutes(&entries_on(entries, day), today, now);
+        historical += daily_target_minutes(cfg, day) - worked;
         day += Duration::days(1);
     }
-    debt.max(0)
+    let worked_today = worked_minutes(&entries_on(entries, today), today, now);
+    let surplus_today = (worked_today - daily_target_minutes(cfg, today)).max(0);
+    (historical - surplus_today).max(0)
 }
 
 /// Gaps between consecutive logged entries for `day`, sorted by start time.
@@ -114,7 +144,7 @@ pub fn leave_time(
     now: NaiveTime,
 ) -> NaiveTime {
     leave_time_after(
-        minutes_left_today(entries, cfg, today),
+        minutes_left_today(entries, cfg, today, now),
         entries,
         cfg,
         today,
@@ -131,7 +161,7 @@ pub fn leave_time_week(
     now: NaiveTime,
 ) -> NaiveTime {
     leave_time_after(
-        minutes_left_week(entries, cfg, today),
+        minutes_left_week(entries, cfg, today, now),
         entries,
         cfg,
         today,
@@ -207,6 +237,12 @@ mod tests {
         NaiveDate::from_ymd_opt(y, m, d).unwrap()
     }
 
+    /// A `now` value for tests where only closed entries are involved, so
+    /// the exact time truly doesn't matter.
+    fn midnight() -> NaiveTime {
+        NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+    }
+
     fn cfg(goal: f64, future_break: u32) -> Config {
         Config {
             weekly_goal_hours: goal,
@@ -219,7 +255,7 @@ mod tests {
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00"), entry(2, d, "13:00", "15:15")];
         let refs: Vec<&TimeEntry> = entries.iter().collect();
-        assert_eq!(worked_minutes(&refs), 4 * 60 + 2 * 60 + 15);
+        assert_eq!(worked_minutes(&refs, d, midnight()), 4 * 60 + 2 * 60 + 15);
     }
 
     #[test]
@@ -245,7 +281,7 @@ mod tests {
         let c = cfg(40.0, 30);
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "18:00")]; // 10h worked, target 8h
-        assert_eq!(minutes_left_today(&entries, &c, d), 0);
+        assert_eq!(minutes_left_today(&entries, &c, d, midnight()), 0);
     }
 
     #[test]
@@ -257,7 +293,10 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "16:00"),  // 8h, Tue
             entry(3, date(2026, 9, 14), "08:00", "16:00"), // next week, excluded
         ];
-        assert_eq!(minutes_left_week(&entries, &c, monday), 40 * 60 - 16 * 60);
+        assert_eq!(
+            minutes_left_week(&entries, &c, monday, midnight()),
+            40 * 60 - 16 * 60
+        );
     }
 
     #[test]
@@ -265,7 +304,7 @@ mod tests {
         let c = cfg(10.0, 30);
         let monday = date(2026, 9, 7);
         let entries = vec![entry(1, monday, "08:00", "18:00")]; // 10h worked, goal 10h
-        assert_eq!(minutes_left_week(&entries, &c, monday), 0);
+        assert_eq!(minutes_left_week(&entries, &c, monday, midnight()), 0);
     }
 
     #[test]
@@ -282,7 +321,7 @@ mod tests {
     fn time_debt_zero_on_first_day_of_week() {
         let c = cfg(40.0, 30);
         let monday = date(2026, 9, 7);
-        assert_eq!(time_debt_minutes(&[], &c, monday), 0);
+        assert_eq!(time_debt_minutes(&[], &c, monday, midnight()), 0);
     }
 
     #[test]
@@ -295,9 +334,9 @@ mod tests {
             entry(4, date(2026, 9, 10), "08:00", "13:10"), // Thu 5h10m, deficit 2h50m
         ];
         let friday = date(2026, 9, 11);
-        // Only Mon-Thu have elapsed; Friday itself is excluded.
+        // Nothing worked yet today, so no surplus to offset the debt with.
         assert_eq!(
-            time_debt_minutes(&entries, &c, friday),
+            time_debt_minutes(&entries, &c, friday, midnight()),
             150 + 100 + 75 + 170
         );
     }
@@ -310,7 +349,7 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "13:00"), // Tue 5h, deficit 3h
         ];
         let wednesday = date(2026, 9, 9);
-        assert_eq!(time_debt_minutes(&entries, &c, wednesday), 180);
+        assert_eq!(time_debt_minutes(&entries, &c, wednesday, midnight()), 180);
     }
 
     #[test]
@@ -321,7 +360,7 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "14:40"), // Tue 6h40m, deficit 1h20m
         ];
         let wednesday = date(2026, 9, 9);
-        assert_eq!(time_debt_minutes(&entries, &c, wednesday), 0);
+        assert_eq!(time_debt_minutes(&entries, &c, wednesday, midnight()), 0);
     }
 
     #[test]
@@ -335,9 +374,63 @@ mod tests {
             entry(5, date(2026, 9, 11), "08:00", "16:00"), // Fri 8h, on target
             entry(6, date(2026, 9, 12), "09:00", "10:00"), // Sat 1h (target 0), offsets debt
         ];
-        // Sunday: the whole Mon-Sat week has elapsed.
+        // Sunday: the whole Mon-Sat week has elapsed; nothing logged Sunday itself.
         let sunday = date(2026, 9, 13);
-        assert_eq!(time_debt_minutes(&entries, &c, sunday), 100 - 60);
+        assert_eq!(
+            time_debt_minutes(&entries, &c, sunday, midnight()),
+            100 - 60
+        );
+    }
+
+    #[test]
+    fn time_debt_cleared_live_by_todays_surplus_before_day_ends() {
+        let c = cfg(40.0, 0); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "13:30"), // Mon deficit 2h30m (150min)
+            entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
+            entry(3, date(2026, 9, 9), "08:00", "16:00"), // Wed 8h, on target
+            entry(4, date(2026, 9, 10), "08:00", "16:00"), // Thu 8h, on target
+            entry(5, date(2026, 9, 11), "08:00", "18:30"), // Fri: 10h30m so far, surplus 150min
+        ];
+        let friday = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
+        // Paid off mid-day, well before Friday is actually over.
+        assert_eq!(time_debt_minutes(&entries, &c, friday, now), 0);
+    }
+
+    #[test]
+    fn time_debt_reduced_but_not_cleared_by_partial_surplus() {
+        let c = cfg(40.0, 0);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "13:30"), // Mon deficit 150min
+            entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
+            entry(3, date(2026, 9, 9), "08:00", "16:00"), // Wed 8h, on target
+            entry(4, date(2026, 9, 10), "08:00", "16:00"), // Thu 8h, on target
+            entry(5, date(2026, 9, 11), "08:00", "16:30"), // Fri 8h30m, surplus 30min
+        ];
+        let friday = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("16:30", "%H:%M").unwrap();
+        assert_eq!(time_debt_minutes(&entries, &c, friday, now), 150 - 30);
+    }
+
+    #[test]
+    fn time_debt_reflects_live_open_entry_progress() {
+        let c = cfg(40.0, 0);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "13:30"), // Mon deficit 150min
+            entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
+            entry(3, date(2026, 9, 9), "08:00", "16:00"), // Wed 8h, on target
+            entry(4, date(2026, 9, 10), "08:00", "16:00"), // Thu 8h, on target
+            open(5, date(2026, 9, 11), "08:00"),          // Fri: open block since 08:00
+        ];
+        let friday = date(2026, 9, 11);
+        // Only 6h worked so far - below today's own 8h target, no surplus yet.
+        let now_early = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
+        assert_eq!(time_debt_minutes(&entries, &c, friday, now_early), 150);
+        // By 18:30, 10h30m elapsed - 2h30m surplus, exactly enough to clear
+        // the debt, without ever calling `time end`.
+        let now_later = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
+        assert_eq!(time_debt_minutes(&entries, &c, friday, now_later), 0);
     }
 
     #[test]
@@ -441,6 +534,27 @@ mod tests {
     }
 
     #[test]
+    fn leave_time_holds_steady_while_an_open_block_is_running() {
+        let c = cfg(40.0, 0); // 8h/day target, no break padding
+        let d = date(2026, 9, 11);
+        let entries = vec![open(1, d, "08:00")];
+        // At 08:00, 0 worked, full 8h owed: leave at 16:00.
+        let now1 = NaiveTime::parse_from_str("08:00", "%H:%M").unwrap();
+        assert_eq!(
+            leave_time(&entries, &c, d, now1),
+            NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
+        );
+        // An hour later, still working (block still open): that hour's now
+        // been earned back, so the projection holds at 16:00 rather than
+        // receding to 17:00.
+        let now2 = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
+        assert_eq!(
+            leave_time(&entries, &c, d, now2),
+            NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
+        );
+    }
+
+    #[test]
     fn overlaps_cases() {
         let d = date(2026, 9, 11);
         let a = entry(1, d, "08:00", "12:00");
@@ -467,9 +581,30 @@ mod tests {
     }
 
     #[test]
-    fn entry_minutes_open_entry_is_zero() {
+    fn entry_minutes_open_entry_at_start_is_zero() {
         let d = date(2026, 9, 11);
-        assert_eq!(entry_minutes(&open(1, d, "12:35")), 0);
+        let now = NaiveTime::parse_from_str("12:35", "%H:%M").unwrap();
+        assert_eq!(entry_minutes(&open(1, d, "12:35"), d, now), 0);
+    }
+
+    #[test]
+    fn entry_minutes_open_today_counts_elapsed() {
+        let d = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("10:15", "%H:%M").unwrap();
+        assert_eq!(entry_minutes(&open(1, d, "08:00"), d, now), 135); // 2h15m
+    }
+
+    #[test]
+    fn entry_minutes_open_from_past_day_counts_through_end_of_day() {
+        let yesterday = date(2026, 9, 10);
+        let today = date(2026, 9, 11);
+        let now = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap(); // today; irrelevant here
+        // Started 22:00 yesterday, never closed: counted through 23:59:59
+        // that day, not against today's wall-clock time.
+        assert_eq!(
+            entry_minutes(&open(1, yesterday, "22:00"), today, now),
+            119 // 22:00 -> 23:59:59 is 1h59m59s; num_minutes() truncates
+        );
     }
 
     #[test]
@@ -481,10 +616,15 @@ mod tests {
     }
 
     #[test]
-    fn worked_minutes_ignores_open_entry() {
+    fn worked_minutes_includes_live_open_entry() {
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00"), open(2, d, "12:35")];
-        assert_eq!(worked_minutes(&entries.iter().collect::<Vec<_>>()), 4 * 60);
+        let now = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
+        // Closed 4h + open-so-far 1h25m (12:35 -> 14:00).
+        assert_eq!(
+            worked_minutes(&entries.iter().collect::<Vec<_>>(), d, now),
+            4 * 60 + 85
+        );
     }
 
     #[test]

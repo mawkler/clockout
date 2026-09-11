@@ -605,7 +605,8 @@ fn current_buf(m: &mut ModalState) -> &mut String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
-    let debt = calc::time_debt_minutes(&app.entries, &app.config, app.today());
+    let now = Local::now().time();
+    let debt = calc::time_debt_minutes(&app.entries, &app.config, app.today(), now);
     let stats_height = if debt > 0 { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -631,9 +632,10 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
+    let now = Local::now().time();
     let target_today = calc::daily_target_minutes(&app.config, today);
     let mut spans = if target_today == 0 {
-        let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today));
+        let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
         vec![
             Span::styled(
                 "No target today — logged ",
@@ -645,7 +647,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        let now = Local::now().time();
         let leave = calc::leave_time(&app.entries, &app.config, today, now);
         vec![
             Span::styled(
@@ -676,15 +677,16 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
     let today = app.today();
-    let worked_today = calc::worked_minutes(&calc::entries_on(&app.entries, today));
+    let now = Local::now().time();
+    let worked_today = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
     let target_today = calc::daily_target_minutes(&app.config, today);
-    let left_today = calc::minutes_left_today(&app.entries, &app.config, today);
+    let left_today = calc::minutes_left_today(&app.entries, &app.config, today, now);
 
     let (week_start, _) = calc::week_bounds(today);
-    let worked_week = calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start));
+    let worked_week =
+        calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start), today, now);
     let goal_week = calc::weekly_goal_minutes(&app.config);
-    let left_week = calc::minutes_left_week(&app.entries, &app.config, today);
-    let now = Local::now().time();
+    let left_week = calc::minutes_left_week(&app.entries, &app.config, today, now);
     let clear_debt_by = calc::leave_time_week(&app.entries, &app.config, today, now);
 
     let label = Style::default().fg(LABEL);
@@ -822,7 +824,7 @@ fn week_items(app: &App, inner_width: u16, selected: usize) -> Vec<ListItem<'sta
         .enumerate()
         .map(|(i, day)| {
             let day_entries = calc::entries_on(&app.entries, day);
-            let total = calc::worked_minutes(&day_entries);
+            let total = calc::worked_minutes(&day_entries, today, now);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
             let bar_width = inner_width.saturating_sub(prefix.chars().count() as u16);
             let cells = day_bar(

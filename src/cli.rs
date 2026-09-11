@@ -256,14 +256,18 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     let data = storage::load_entries()?;
     let now = Local::now().time();
 
-    let worked_today = calc::worked_minutes(&calc::entries_on(&data.entries, today));
+    let worked_today = calc::worked_minutes(&calc::entries_on(&data.entries, today), today, now);
     let target_today = calc::daily_target_minutes(&cfg, today);
-    let left_today = calc::minutes_left_today(&data.entries, &cfg, today);
+    let left_today = calc::minutes_left_today(&data.entries, &cfg, today, now);
 
     let (week_start, _) = calc::week_bounds(today);
-    let worked_week = calc::worked_minutes(&calc::entries_in_week(&data.entries, week_start));
+    let worked_week = calc::worked_minutes(
+        &calc::entries_in_week(&data.entries, week_start),
+        today,
+        now,
+    );
     let goal_week = calc::weekly_goal_minutes(&cfg);
-    let left_week = calc::minutes_left_week(&data.entries, &cfg, today);
+    let left_week = calc::minutes_left_week(&data.entries, &cfg, today, now);
 
     println!("{} ({})", today, today.format("%A"));
     if target_today == 0 {
@@ -284,7 +288,7 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         calc::format_hm(goal_week),
         calc::format_hm(left_week)
     );
-    let debt = calc::time_debt_minutes(&data.entries, &cfg, today);
+    let debt = calc::time_debt_minutes(&data.entries, &cfg, today, now);
     if debt > 0 {
         let clear_debt_by = calc::leave_time_week(&data.entries, &cfg, today, now);
         println!(
