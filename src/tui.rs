@@ -441,14 +441,9 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
     let label = Style::default().fg(LABEL);
     let value = Style::default().add_modifier(Modifier::BOLD);
 
-    let stat_line = |prefix: &str,
-                     worked: i64,
-                     of: &str,
-                     total: i64,
-                     remaining: i64,
-                     clear_by: Option<NaiveTime>| {
+    let stat_line = |prefix: &str, worked: i64, of: &str, total: i64, remaining: i64| {
         let left_color = if remaining == 0 { SUCCESS } else { ACCENT };
-        let mut spans = vec![
+        Line::from(vec![
             Span::styled(prefix.to_string(), label),
             Span::styled(calc::format_hm(worked), value),
             Span::styled(format!(" / {} {of} ", calc::format_hm(total)), label),
@@ -456,15 +451,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
                 format!("({} left)", calc::format_hm(remaining)),
                 Style::default().fg(left_color).add_modifier(Modifier::BOLD),
             ),
-        ];
-        if let Some(t) = clear_by {
-            spans.push(Span::styled(" · clear time debt by ", label));
-            spans.push(Span::styled(
-                t.format("%H:%M").to_string(),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-        }
-        Line::from(spans)
+        ])
     };
 
     let mut lines = vec![
@@ -474,16 +461,8 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
             "target",
             target_today,
             left_today,
-            None,
         ),
-        stat_line(
-            "This week: ",
-            worked_week,
-            "goal",
-            goal_week,
-            left_week,
-            Some(clear_debt_by),
-        ),
+        stat_line("This week: ", worked_week, "goal", goal_week, left_week),
     ];
     if debt > 0 {
         lines.push(Line::from(vec![
@@ -492,7 +471,11 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
                 calc::format_hm(debt),
                 Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(" (shortfall from earlier this week)", label),
+            Span::styled(" · clear by ", label),
+            Span::styled(
+                clear_debt_by.format("%H:%M").to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
         ]));
     }
     let p = Paragraph::new(lines).block(gray_block(""));
