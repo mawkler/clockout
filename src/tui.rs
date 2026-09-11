@@ -20,6 +20,20 @@ use crate::model::{Config, TimeEntry};
 use crate::parse;
 use crate::storage;
 
+const BORDER: Color = Color::DarkGray;
+const MUTED: Color = Color::DarkGray;
+const LABEL: Color = Color::Gray;
+const ACCENT: Color = Color::Cyan;
+const DANGER: Color = Color::Red;
+const SUCCESS: Color = Color::Green;
+
+fn gray_block(title: impl Into<String>) -> Block<'static> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(BORDER))
+        .title(title.into())
+}
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum View {
     Today,
@@ -354,27 +368,30 @@ fn draw(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let target_today = calc::daily_target_minutes(&app.config, today);
-    let text = if target_today == 0 {
+    let line = if target_today == 0 {
         let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today));
-        format!("No target today — logged {}", calc::format_hm(worked))
+        Line::from(vec![
+            Span::styled("No target today — logged ", Style::default().fg(LABEL)),
+            Span::styled(
+                calc::format_hm(worked),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ])
     } else {
         let now = Local::now().time();
         let leave = calc::leave_time(&app.entries, &app.config, today, now);
-        format!("Leave at {}", leave.format("%H:%M"))
+        Line::from(vec![
+            Span::styled("Leave at ", Style::default().fg(LABEL)),
+            Span::styled(
+                leave.format("%H:%M").to_string(),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ])
     };
-    let block = Block::default().borders(Borders::ALL).title(format!(
-        " {} ({}) ",
-        today,
-        today.format("%A")
-    ));
-    let p = Paragraph::new(Line::from(Span::styled(
-        text,
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-    )))
-    .alignment(Alignment::Center)
-    .block(block);
+    let block = gray_block(format!(" {} ({}) ", today, today.format("%A")));
+    let p = Paragraph::new(line)
+        .alignment(Alignment::Center)
+        .block(block);
     f.render_widget(p, area);
 }
 
@@ -389,21 +406,33 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect) {
     let goal_week = calc::weekly_goal_minutes(&app.config);
     let left_week = calc::minutes_left_week(&app.entries, &app.config, today);
 
+    let label = Style::default().fg(LABEL);
+    let value = Style::default().add_modifier(Modifier::BOLD);
+
+    let stat_line = |prefix: &str, worked: i64, of: &str, total: i64, remaining: i64| {
+        let left_color = if remaining == 0 { SUCCESS } else { ACCENT };
+        Line::from(vec![
+            Span::styled(prefix.to_string(), label),
+            Span::styled(calc::format_hm(worked), value),
+            Span::styled(format!(" / {} {of} ", calc::format_hm(total)), label),
+            Span::styled(
+                format!("({} left)", calc::format_hm(remaining)),
+                Style::default().fg(left_color).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+
     let lines = vec![
-        Line::from(format!(
-            "Today:     {} / {} target ({} left)",
-            calc::format_hm(worked_today),
-            calc::format_hm(target_today),
-            calc::format_hm(left_today)
-        )),
-        Line::from(format!(
-            "This week: {} / {} goal ({} left)",
-            calc::format_hm(worked_week),
-            calc::format_hm(goal_week),
-            calc::format_hm(left_week)
-        )),
+        stat_line(
+            "Today:     ",
+            worked_today,
+            "target",
+            target_today,
+            left_today,
+        ),
+        stat_line("This week: ", worked_week, "goal", goal_week, left_week),
     ];
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+    let p = Paragraph::new(lines).block(gray_block(""));
     f.render_widget(p, area);
 }
 
@@ -417,13 +446,14 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
 
     let mut items: Vec<ListItem> = Vec::new();
     for e in &visible {
-        items.push(ListItem::new(format!(
-            "#{:<4} {} {}-{}",
-            e.id,
-            e.date,
-            e.start.format("%H:%M"),
-            e.end.format("%H:%M")
-        )));
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(format!("#{:<4} ", e.id), Style::default().fg(MUTED)),
+            Span::styled(format!("{} ", e.date), Style::default().fg(LABEL)),
+            Span::styled(
+                format!("{}-{}", e.start.format("%H:%M"), e.end.format("%H:%M")),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ])));
     }
     if app.view == View::Today {
         for (start, end) in gaps {
@@ -433,12 +463,15 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
                     start.format("%H:%M"),
                     end.format("%H:%M")
                 ),
-                Style::default().add_modifier(Modifier::DIM),
+                Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
             )));
         }
     }
     if items.is_empty() {
-        items.push(ListItem::new("no entries"));
+        items.push(ListItem::new(Span::styled(
+            "no entries",
+            Style::default().fg(MUTED),
+        )));
     }
 
     let mut state = ListState::default();
@@ -446,18 +479,26 @@ fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected.min(visible.len() - 1)));
     }
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    let list = List::new(items).block(gray_block(title)).highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(ACCENT)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_stateful_widget(list, area, &mut state);
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let text = match &app.status {
-        Some(s) => s.clone(),
-        None => "q quit | a add | e edit | d delete | j/k move | Tab view | r reload".to_string(),
+    let p = match &app.status {
+        Some(s) => Paragraph::new(Span::styled(
+            s.clone(),
+            Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+        )),
+        None => Paragraph::new(Span::styled(
+            "q quit | a add | e edit | d delete | j/k move | Tab view | r reload",
+            Style::default().fg(MUTED),
+        )),
     };
-    let p = Paragraph::new(text);
     f.render_widget(p, area);
 }
 
@@ -481,7 +522,7 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
     } else {
         " Add entry "
     };
-    let block = Block::default().borders(Borders::ALL).title(title);
+    let block = gray_block(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -498,12 +539,15 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
 
     let field = |label: &str, value: &str, focused: bool| {
         let style = if focused {
-            Style::default().add_modifier(Modifier::REVERSED)
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
         Line::from(vec![
-            Span::raw(format!("{label}: ")),
+            Span::styled(format!("{label}: "), Style::default().fg(LABEL)),
             Span::styled(value.to_string(), style),
         ])
     };
@@ -526,12 +570,18 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
     );
     if let Some(err) = &m.error {
         f.render_widget(
-            Paragraph::new(Span::styled(err.as_str(), Style::default().fg(Color::Red))),
+            Paragraph::new(Span::styled(
+                err.as_str(),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )),
             chunks[3],
         );
     }
     f.render_widget(
-        Paragraph::new("Tab: next field | Enter: save | Esc: cancel"),
+        Paragraph::new(Span::styled(
+            "Tab: next field | Enter: save | Esc: cancel",
+            Style::default().fg(MUTED),
+        )),
         chunks[4],
     );
 }
@@ -539,7 +589,19 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
 fn draw_confirm(f: &mut Frame, id: u64) {
     let area = centered_rect(40, 3, f.area());
     f.render_widget(Clear, area);
-    let block = Block::default().borders(Borders::ALL).title(" Confirm ");
-    let p = Paragraph::new(format!("Delete entry #{id}? (y/n)")).block(block);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(DANGER))
+        .title(" Confirm ");
+    let p = Paragraph::new(Line::from(vec![
+        Span::raw("Delete entry "),
+        Span::styled(
+            format!("#{id}"),
+            Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("? "),
+        Span::styled("(y/n)", Style::default().fg(MUTED)),
+    ]))
+    .block(block);
     f.render_widget(p, area);
 }
