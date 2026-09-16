@@ -72,12 +72,22 @@ struct ModalState {
     error: Option<String>,
 }
 
+/// Which of the two panes j/k currently navigates. Switched with Tab.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Pane {
+    Days,
+    Entries,
+}
+
 struct App {
     entries: Vec<TimeEntry>,
     config: Config,
     /// The day whose entries show in the entries panel and whose row is
-    /// marked in the week diagram. Defaults to today; moved with h/l.
+    /// marked in the week diagram. Defaults to today; moved with j/k while
+    /// the Days pane has focus.
     focused_day: NaiveDate,
+    /// Which pane Tab has focus on; determines what j/k moves.
+    focus_pane: Pane,
     /// Index into the focused day's entries, for e/d and highlighting.
     selected: usize,
     mode: Mode,
@@ -93,6 +103,7 @@ impl App {
             entries,
             config,
             focused_day: Local::now().date_naive(),
+            focus_pane: Pane::Entries,
             selected: 0,
             mode: Mode::Normal,
             status: None,
@@ -147,7 +158,8 @@ impl App {
 
     /// Moves the focused day within the current week (clamped to
     /// Monday..Sunday) and resets entry selection, since the entry list
-    /// underneath just changed.
+    /// underneath just changed. Called from j/k while the Days pane has
+    /// focus.
     fn move_focused_day(&mut self, delta: i64) {
         let (week_start, week_end) = calc::week_bounds(self.today());
         let moved = self.focused_day + chrono::Duration::days(delta);
@@ -446,13 +458,23 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('a') => app.open_add(),
             KeyCode::Char('f') => app.open_finish(),
-            KeyCode::Char('e') => app.open_edit(),
-            KeyCode::Char('d') => app.request_delete(),
+            KeyCode::Char('e') if app.focus_pane == Pane::Entries => app.open_edit(),
+            KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
             KeyCode::Char('r') => app.reload()?,
-            KeyCode::Char('h') | KeyCode::Left => app.move_focused_day(-1),
-            KeyCode::Char('l') | KeyCode::Right => app.move_focused_day(1),
-            KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
-            KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
+            KeyCode::Tab => {
+                app.focus_pane = match app.focus_pane {
+                    Pane::Days => Pane::Entries,
+                    Pane::Entries => Pane::Days,
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => match app.focus_pane {
+                Pane::Days => app.move_focused_day(1),
+                Pane::Entries => app.move_selection(1),
+            },
+            KeyCode::Char('k') | KeyCode::Up => match app.focus_pane {
+                Pane::Days => app.move_focused_day(-1),
+                Pane::Entries => app.move_selection(-1),
+            },
             _ => {}
         },
         Mode::ConfirmDelete(id) => {
@@ -700,12 +722,19 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
         state.select(Some(app.selected.min(len - 1)));
     }
 
-    let title = format!(" {} ({}) ", day, day.format("%A"));
-    let list = List::new(items).block(gray_block(title)).highlight_style(
+    // Dimmed (bold only, no reverse) while the Days pane has focus instead
+    // of this one, so it's clear j/k won't move this selection right now.
+    let highlight_style = if app.focus_pane == Pane::Entries {
         Style::default()
             .add_modifier(Modifier::REVERSED)
-            .add_modifier(Modifier::BOLD),
-    );
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().add_modifier(Modifier::BOLD)
+    };
+    let title = format!(" {} ({}) ", day, day.format("%A"));
+    let list = List::new(items)
+        .block(gray_block(title))
+        .highlight_style(highlight_style);
     f.render_stateful_widget(list, area, &mut state);
 }
 
@@ -736,12 +765,17 @@ fn week_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             );
 
             // Mark the focused row on its prefix only - inverting the whole
-            // line would make the bar's own colors hard to read.
+            // line would make the bar's own colors hard to read. Dimmed
+            // (bold only, no reverse) while the Entries pane has focus
+            // instead of this one, so it's clear j/k won't move this row
+            // right now.
             let prefix_style = if day == app.focused_day {
-                Style::default()
-                    .fg(LABEL)
-                    .add_modifier(Modifier::REVERSED)
-                    .add_modifier(Modifier::BOLD)
+                let base = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
+                if app.focus_pane == Pane::Days {
+                    base.add_modifier(Modifier::REVERSED)
+                } else {
+                    base
+                }
             } else {
                 Style::default().fg(LABEL)
             };
@@ -877,7 +911,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ))
         }
         None => {
-            let hint = "q quit | a add to this day | f finish | e edit | d delete | h/l day | j/k entry | r reload";
+            let hint = "q quit | a add to this day | f finish | e edit | d delete | Tab pane | j/k move | r reload";
             Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
         }
     };
