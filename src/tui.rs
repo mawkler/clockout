@@ -34,12 +34,6 @@ fn gray_block(title: impl Into<String>) -> Block<'static> {
         .title(title.into())
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum View {
-    Today,
-    Week,
-}
-
 enum Mode {
     Normal,
     Modal(ModalState),
@@ -81,7 +75,10 @@ struct ModalState {
 struct App {
     entries: Vec<TimeEntry>,
     config: Config,
-    view: View,
+    /// The day whose entries show in the entries panel and whose row is
+    /// marked in the week diagram. Defaults to today; moved with h/l.
+    focused_day: NaiveDate,
+    /// Index into the focused day's entries, for e/d and highlighting.
     selected: usize,
     mode: Mode,
     status: Option<(StatusKind, String)>,
@@ -95,7 +92,7 @@ impl App {
         Ok(App {
             entries,
             config,
-            view: View::Today,
+            focused_day: Local::now().date_naive(),
             selected: 0,
             mode: Mode::Normal,
             status: None,
@@ -106,7 +103,7 @@ impl App {
     fn reload(&mut self) -> Result<()> {
         self.entries = storage::load_entries()?.entries;
         self.config = storage::load_config()?;
-        let len = self.visible_len();
+        let len = self.visible().len();
         if len == 0 {
             self.selected = 0;
         } else if self.selected >= len {
@@ -119,39 +116,19 @@ impl App {
         Local::now().date_naive()
     }
 
+    /// The focused day's entries, sorted by start time.
     fn visible(&self) -> Vec<&TimeEntry> {
-        let today = self.today();
-        let mut v = match self.view {
-            View::Today => calc::entries_on(&self.entries, today),
-            View::Week => {
-                let (week_start, _) = calc::week_bounds(today);
-                calc::entries_in_week(&self.entries, week_start)
-            }
-        };
-        v.sort_by_key(|e| (e.date, e.start));
+        let mut v = calc::entries_on(&self.entries, self.focused_day);
+        v.sort_by_key(|e| e.start);
         v
     }
 
-    /// Distinct dates with logged entries in the current week, ascending.
-    /// Used for the week view, which shows one summary row per day.
-    fn visible_days(&self) -> Vec<NaiveDate> {
+    /// The 7 days (Monday-Sunday) of the current week, for the diagram.
+    fn week_days(&self) -> Vec<NaiveDate> {
         let (week_start, _) = calc::week_bounds(self.today());
-        let mut dates: Vec<NaiveDate> = calc::entries_in_week(&self.entries, week_start)
-            .iter()
-            .map(|e| e.date)
-            .collect();
-        dates.sort();
-        dates.dedup();
-        dates
-    }
-
-    /// Number of selectable rows for the current view: entries in Today
-    /// view, day-summary rows in Week view.
-    fn visible_len(&self) -> usize {
-        match self.view {
-            View::Today => self.visible().len(),
-            View::Week => self.visible_days().len(),
-        }
+        (0..7)
+            .map(|i| week_start + chrono::Duration::days(i))
+            .collect()
     }
 
     fn selected_entry(&self) -> Option<TimeEntry> {
@@ -159,7 +136,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: i32) {
-        let len = self.visible_len();
+        let len = self.visible().len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -168,26 +145,24 @@ impl App {
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
     }
 
-    /// Open the add-entry modal, prefilled with today and now. Leaving the
-    /// end field blank on submit starts an open-ended block instead of a
-    /// closed entry.
-    /// Open the add-entry modal, prefilled with now and, in week view, the
-    /// currently selected day (falling back to today if the week has no
-    /// days to select yet). Leaving the end field blank on submit starts an
-    /// open-ended block instead of a closed entry.
+    /// Moves the focused day within the current week (clamped to
+    /// Monday..Sunday) and resets entry selection, since the entry list
+    /// underneath just changed.
+    fn move_focused_day(&mut self, delta: i64) {
+        let (week_start, week_end) = calc::week_bounds(self.today());
+        let moved = self.focused_day + chrono::Duration::days(delta);
+        self.focused_day = moved.clamp(week_start, week_end);
+        self.selected = 0;
+    }
+
+    /// Open the add-entry modal, prefilled with the focused day and now.
+    /// Leaving the end field blank on submit starts an open-ended block
+    /// instead of a closed entry.
     fn open_add(&mut self) {
-        let date = match self.view {
-            View::Week => self
-                .visible_days()
-                .get(self.selected)
-                .copied()
-                .unwrap_or_else(|| self.today()),
-            View::Today => self.today(),
-        };
         self.mode = Mode::Modal(ModalState {
             kind: ModalKind::AddEdit,
             editing_id: None,
-            date_buf: date.to_string(),
+            date_buf: self.focused_day.to_string(),
             start_buf: Local::now().time().format("%H:%M").to_string(),
             end_buf: String::new(),
             time_buf: String::new(),
@@ -471,17 +446,11 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('a') => app.open_add(),
             KeyCode::Char('f') => app.open_finish(),
-            KeyCode::Char('e') if app.view == View::Today => app.open_edit(),
-            KeyCode::Char('d') if app.view == View::Today => app.request_delete(),
+            KeyCode::Char('e') => app.open_edit(),
+            KeyCode::Char('d') => app.request_delete(),
             KeyCode::Char('r') => app.reload()?,
-            KeyCode::Tab => {
-                app.view = if app.view == View::Today {
-                    View::Week
-                } else {
-                    View::Today
-                };
-                app.selected = 0;
-            }
+            KeyCode::Char('h') | KeyCode::Left => app.move_focused_day(-1),
+            KeyCode::Char('l') | KeyCode::Right => app.move_focused_day(1),
             KeyCode::Char('j') | KeyCode::Down => app.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => app.move_selection(-1),
             _ => {}
@@ -554,6 +523,7 @@ fn draw(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Length(stats_height),
+            Constraint::Length(9),
             Constraint::Min(3),
             Constraint::Length(1),
         ])
@@ -561,8 +531,9 @@ fn draw(f: &mut Frame, app: &App) {
 
     draw_header(f, app, chunks[0]);
     draw_stats(f, app, chunks[1], debt);
-    draw_entries(f, app, chunks[2]);
-    draw_footer(f, app, chunks[3]);
+    draw_week_diagram(f, app, chunks[2]);
+    draw_day_entries(f, app, chunks[3]);
+    draw_footer(f, app, chunks[4]);
 
     match &app.mode {
         Mode::Modal(m) => draw_modal(f, m),
@@ -674,53 +645,22 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
     f.render_widget(p, area);
 }
 
-fn draw_entries(f: &mut Frame, app: &App, area: Rect) {
-    let title = match app.view {
-        View::Today => " Today (Tab: week view) ",
-        View::Week => " This week (Tab: today view) ",
-    };
+/// The week diagram: one row per day of the current week, always shown -
+/// h/l moves which day is focused (marked on its prefix).
+fn draw_week_diagram(f: &mut Frame, app: &App, area: Rect) {
     // Matches Block::inner() for a plain Borders::ALL block: 1 column each side.
     let inner_width = area.width.saturating_sub(2);
-
-    let items: Vec<ListItem> = match app.view {
-        View::Today => today_items(app),
-        View::Week => week_items(app, inner_width, app.selected),
-    };
-    let no_entries = items.is_empty();
-    let items = if no_entries {
-        vec![ListItem::new(Span::styled(
-            "no entries",
-            Style::default().fg(MUTED),
-        ))]
-    } else {
-        items
-    };
-
-    let mut state = ListState::default();
-    let len = app.visible_len();
-    if len > 0 {
-        state.select(Some(app.selected.min(len - 1)));
-    }
-
-    // Week view marks the selected row itself (bolding its weekday/hours
-    // prefix in week_items) rather than inverting the whole line, since
-    // inverting would make the bar's own colors hard to read.
-    let highlight_style = match app.view {
-        View::Today => Style::default()
-            .add_modifier(Modifier::REVERSED)
-            .add_modifier(Modifier::BOLD),
-        View::Week => Style::default(),
-    };
-    let list = List::new(items)
-        .block(gray_block(title))
-        .highlight_style(highlight_style);
-    f.render_stateful_widget(list, area, &mut state);
+    let lines = week_lines(app, inner_width);
+    let p = Paragraph::new(lines).block(gray_block(" This week "));
+    f.render_widget(p, area);
 }
 
-fn today_items(app: &App) -> Vec<ListItem<'static>> {
-    let today = app.today();
-    let entries = calc::entries_on(&app.entries, today);
-    let gaps = calc::today_gaps(&app.entries, today);
+/// The entries panel: the focused day's entries and gaps. j/k moves
+/// selection within this list, for e/d.
+fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
+    let day = app.focused_day;
+    let entries = calc::entries_on(&app.entries, day);
+    let gaps = calc::today_gaps(&app.entries, day);
 
     let mut items: Vec<ListItem> = Vec::new();
     for e in &entries {
@@ -744,22 +684,43 @@ fn today_items(app: &App) -> Vec<ListItem<'static>> {
             Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
         )));
     }
-    items
+    let no_entries = items.is_empty();
+    let items = if no_entries {
+        vec![ListItem::new(Span::styled(
+            "no entries",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        items
+    };
+
+    let mut state = ListState::default();
+    let len = app.visible().len();
+    if len > 0 {
+        state.select(Some(app.selected.min(len - 1)));
+    }
+
+    let title = format!(" {} ({}) ", day, day.format("%A"));
+    let list = List::new(items).block(gray_block(title)).highlight_style(
+        Style::default()
+            .add_modifier(Modifier::REVERSED)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, area, &mut state);
 }
 
-/// One summary row per worked day: weekday name, total hours, and a bar
-/// showing where in the day the logged time falls (all rows share the same
-/// time-of-day scale so they're visually comparable).
-fn week_items(app: &App, inner_width: u16, selected: usize) -> Vec<ListItem<'static>> {
+/// One line per day of the current week: weekday name, total hours, and a
+/// bar showing where in the day the logged time falls (all rows share the
+/// same time-of-day scale so they're visually comparable).
+fn week_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
     let today = app.today();
     let now = Local::now().time();
     let (week_start, _) = calc::week_bounds(today);
-    let days = app.visible_days();
     let (window_start, window_end) = day_window(&app.entries, week_start, now);
 
-    days.into_iter()
-        .enumerate()
-        .map(|(i, day)| {
+    app.week_days()
+        .into_iter()
+        .map(|day| {
             let day_entries = calc::entries_on(&app.entries, day);
             let total = calc::worked_minutes(&day_entries, today, now);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
@@ -774,9 +735,9 @@ fn week_items(app: &App, inner_width: u16, selected: usize) -> Vec<ListItem<'sta
                 now,
             );
 
-            // Mark the selected row on its prefix only - inverting the
-            // whole line would make the bar's own colors hard to read.
-            let prefix_style = if i == selected {
+            // Mark the focused row on its prefix only - inverting the whole
+            // line would make the bar's own colors hard to read.
+            let prefix_style = if day == app.focused_day {
                 Style::default()
                     .fg(LABEL)
                     .add_modifier(Modifier::REVERSED)
@@ -786,7 +747,7 @@ fn week_items(app: &App, inner_width: u16, selected: usize) -> Vec<ListItem<'sta
             };
             let mut spans = vec![Span::styled(prefix, prefix_style)];
             spans.extend(bar_spans(&cells));
-            ListItem::new(Line::from(spans))
+            Line::from(spans)
         })
         .collect()
 }
@@ -916,14 +877,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ))
         }
         None => {
-            let hint = match app.view {
-                View::Today => {
-                    "q quit | a add | f finish | e edit | d delete | j/k move | Tab view | r reload"
-                }
-                View::Week => {
-                    "q quit | a add to this day | f finish | j/k move | Tab view | r reload"
-                }
-            };
+            let hint = "q quit | a add to this day | f finish | e edit | d delete | h/l day | j/k entry | r reload";
             Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
         }
     };
