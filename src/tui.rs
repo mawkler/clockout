@@ -26,8 +26,6 @@ const LABEL: Color = Color::White;
 const ACCENT: Color = Color::Cyan;
 const DANGER: Color = Color::Red;
 const SUCCESS: Color = Color::Green;
-/// A block that's been started but not finished yet.
-const OPEN: Color = Color::Yellow;
 
 fn gray_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
@@ -882,19 +880,26 @@ fn day_window(
     (start, end)
 }
 
+/// Glyphs an open block's marker fades through, moving forward in time from
+/// its current edge: solid (still-confirmed work) trailing off toward faint
+/// (unknown - it just hasn't happened yet).
+const FADE: [char; 4] = ['█', '▓', '▒', '░'];
+
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Cell {
     Empty,
     Worked,
-    /// Part of a block that's been started but not finished yet.
-    Open,
+    /// Part of a block that's been started but not finished yet. The index
+    /// selects a glyph from `FADE` (0 = solid, fading out from there).
+    Open(usize),
 }
 
 /// Rasterizes a day's entries across `width` columns spanning
-/// [window_start, window_end). An open block (no end yet) gets a single
-/// marker column at its current leading edge - `now` if `day` is `today`, or
-/// the window's end otherwise (no better bound for a block left open on a
-/// past day) - rather than filling its whole (still-growing) span.
+/// [window_start, window_end). An open block (no end yet) gets a short
+/// fading tail (see `FADE`) starting at its current leading edge - `now` if
+/// `day` is `today`, or the window's end otherwise (no better bound for a
+/// block left open on a past day) - rather than filling its whole
+/// (still-growing) span.
 fn day_bar(
     entries: &[&TimeEntry],
     window_start: NaiveTime,
@@ -927,8 +932,10 @@ fn day_bar(
                 .clamp(0, total_minutes);
             let col = ((offset * width as i64) / total_minutes) as usize;
             let col = col.min(width - 1);
-            if cells[col] != Cell::Worked {
-                cells[col] = Cell::Open;
+            for (stage, c) in (col..width).take(FADE.len()).enumerate() {
+                if cells[c] != Cell::Worked {
+                    cells[c] = Cell::Open(stage);
+                }
             }
         }
     }
@@ -946,7 +953,7 @@ fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
         }
         let (ch, style) = match value {
             Cell::Worked => ('█', Style::default().fg(ACCENT)),
-            Cell::Open => ('┃', Style::default().fg(OPEN)),
+            Cell::Open(stage) => (FADE[stage], Style::default().fg(ACCENT)),
             Cell::Empty => ('·', Style::default().fg(MUTED)),
         };
         spans.push(Span::styled(ch.to_string().repeat(j - i), style));
