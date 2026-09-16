@@ -768,7 +768,8 @@ fn week_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
             // line would make the bar's own colors hard to read. Dimmed
             // (bold only, no reverse) while the Entries pane has focus
             // instead of this one, so it's clear j/k won't move this row
-            // right now.
+            // right now. A future, unfocused day is grayed out - it hasn't
+            // happened yet, so there's nothing to show there.
             let prefix_style = if day == app.focused_day {
                 let base = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
                 if app.focus_pane == Pane::Days {
@@ -776,6 +777,8 @@ fn week_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
                 } else {
                     base
                 }
+            } else if day > today {
+                Style::default().fg(MUTED)
             } else {
                 Style::default().fg(LABEL)
             };
