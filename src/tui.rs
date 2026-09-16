@@ -818,26 +818,28 @@ fn day_window(
     (start, end)
 }
 
-/// Glyphs an open block's marker fades through, moving forward in time from
-/// its current edge: solid (still-confirmed work) trailing off toward faint
-/// (unknown - it just hasn't happened yet).
-const FADE: [char; 4] = ['█', '▓', '▒', '░'];
+/// Glyphs for the trailing edge of an open block's elapsed span, ending
+/// exactly at its current edge (the freshest, still-provisional minutes);
+/// everything earlier in that span renders as plain solid `Cell::Worked`,
+/// same as a closed entry.
+const FADE: [char; 3] = ['▓', '▒', '░'];
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Cell {
     Empty,
     Worked,
-    /// Part of a block that's been started but not finished yet. The index
-    /// selects a glyph from `FADE` (0 = solid, fading out from there).
+    /// One of the last few columns of an open block's elapsed span. The
+    /// index selects a glyph from `FADE` (higher = closer to now/fainter).
     Open(usize),
 }
 
 /// Rasterizes a day's entries across `width` columns spanning
-/// [window_start, window_end). An open block (no end yet) gets a short
-/// fading tail (see `FADE`) starting at its current leading edge - `now` if
-/// `day` is `today`, or the window's end otherwise (no better bound for a
-/// block left open on a past day) - rather than filling its whole
-/// (still-growing) span.
+/// [window_start, window_end). An open block (no end yet) is assumed
+/// worked from its start through its current edge - `now` if `day` is
+/// `today`, or the window's end otherwise (no better bound for a block
+/// left open on a past day) - filled solid like a closed entry, except the
+/// last few columns fade out (see `FADE`) so it still reads as ongoing
+/// rather than definitively closed.
 fn day_bar(
     entries: &[&TimeEntry],
     window_start: NaiveTime,
@@ -851,29 +853,46 @@ fn day_bar(
         return Vec::new();
     }
     let total_minutes = (window_end - window_start).num_minutes().max(1);
+    let col_time = |c: usize| {
+        let offset = (c as i64 * total_minutes) / width as i64;
+        window_start + chrono::Duration::minutes(offset)
+    };
+    let is_closed_worked = |t: NaiveTime| {
+        entries
+            .iter()
+            .any(|e| e.end.is_some_and(|end| e.start <= t && t < end))
+    };
+
+    let open = entries.iter().find(|e| e.end.is_none());
+    let open_end = open.map(|_| if day == today { now } else { window_end });
+
     let mut cells: Vec<Cell> = (0..width)
         .map(|c| {
-            let offset = (c as i64 * total_minutes) / width as i64;
-            let t = window_start + chrono::Duration::minutes(offset);
-            let worked = entries
-                .iter()
-                .any(|e| e.end.is_some_and(|end| e.start <= t && t < end));
-            if worked { Cell::Worked } else { Cell::Empty }
+            let t = col_time(c);
+            let open_worked = open
+                .zip(open_end)
+                .is_some_and(|(o, oe)| o.start <= t && t < oe);
+            if is_closed_worked(t) || open_worked {
+                Cell::Worked
+            } else {
+                Cell::Empty
+            }
         })
         .collect();
 
-    if let Some(open) = entries.iter().find(|e| e.end.is_none()) {
-        let open_end = if day == today { now } else { window_end };
-        if open.start < open_end {
-            let offset = (open_end - window_start)
-                .num_minutes()
-                .clamp(0, total_minutes);
-            let col = ((offset * width as i64) / total_minutes) as usize;
-            let col = col.min(width - 1);
-            for (stage, c) in (col..width).take(FADE.len()).enumerate() {
-                if cells[c] != Cell::Worked {
-                    cells[c] = Cell::Open(stage);
-                }
+    if let (Some(open), Some(open_end)) = (open, open_end)
+        && open.start < open_end
+    {
+        let offset = (open_end - window_start)
+            .num_minutes()
+            .clamp(0, total_minutes);
+        let boundary = (((offset * width as i64) / total_minutes) as usize).min(width - 1);
+        for stage in 0..FADE.len() {
+            let back = FADE.len() - 1 - stage;
+            if let Some(c) = boundary.checked_sub(back)
+                && !is_closed_worked(col_time(c))
+            {
+                cells[c] = Cell::Open(stage);
             }
         }
     }
