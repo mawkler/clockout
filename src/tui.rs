@@ -729,18 +729,15 @@ fn today_items(app: &App) -> Vec<ListItem<'static>> {
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{} ", e.date), Style::default().fg(LABEL)),
-            Span::styled(
-                format!("{}-{}", e.start.format("%H:%M"), calc::format_end(e.end)),
-                range_style,
-            ),
-        ])));
+        items.push(ListItem::new(Span::styled(
+            format!("{}-{}", e.start.format("%H:%M"), calc::format_end(e.end)),
+            range_style,
+        )));
     }
     for (start, end) in gaps {
         items.push(ListItem::new(Span::styled(
             format!(
-                "           {}-{} (gap/break)",
+                "{}-{} (gap/break)",
                 start.format("%H:%M"),
                 end.format("%H:%M")
             ),
