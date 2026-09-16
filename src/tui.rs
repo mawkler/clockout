@@ -913,12 +913,32 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))
         }
-        None => {
-            let hint = "q quit | a add to this day | f finish | e edit | d delete | Tab pane | j/k move | r reload";
-            Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
-        }
+        None => Paragraph::new(hint_line(&[
+            ("q", "quit"),
+            ("a", "add to this day"),
+            ("f", "finish"),
+            ("e", "edit"),
+            ("d", "delete"),
+            ("Tab", "switch pane"),
+            ("j/k", "move"),
+            ("r", "reload"),
+        ])),
     };
     f.render_widget(p, area);
+}
+
+/// Renders "key description | key description | ...", the key in LABEL
+/// (brighter) and the rest in MUTED, so the keys themselves stand out.
+fn hint_line(pairs: &[(&str, &str)]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (i, (key, desc)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ", Style::default().fg(MUTED)));
+        }
+        spans.push(Span::styled(key.to_string(), Style::default().fg(LABEL)));
+        spans.push(Span::styled(format!(" {desc}"), Style::default().fg(MUTED)));
+    }
+    Line::from(spans)
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
