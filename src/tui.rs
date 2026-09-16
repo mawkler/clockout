@@ -958,7 +958,7 @@ fn field_line(label: &str, value: &str, focused: bool, field_selected: bool) -> 
 fn draw_modal(f: &mut Frame, m: &ModalState) {
     match m.kind {
         ModalKind::AddEdit => draw_add_edit_modal(f, m),
-        ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time (HH:MM)"),
+        ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time"),
     }
 }
 
@@ -988,7 +988,7 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
 
     f.render_widget(
         Paragraph::new(field_line(
-            "Date (YYYY-MM-DD/today/yesterday)",
+            "Date",
             &m.date_buf,
             m.focus == 0,
             m.field_selected,
@@ -997,7 +997,7 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
     );
     f.render_widget(
         Paragraph::new(field_line(
-            "Start (HH:MM)",
+            "Start",
             &m.start_buf,
             m.focus == 1,
             m.field_selected,
@@ -1006,7 +1006,7 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
     );
     f.render_widget(
         Paragraph::new(field_line(
-            "End (HH:MM, blank = still going)",
+            "End",
             &m.end_buf,
             m.focus == 2,
             m.field_selected,
