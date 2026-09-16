@@ -171,11 +171,23 @@ impl App {
     /// Open the add-entry modal, prefilled with today and now. Leaving the
     /// end field blank on submit starts an open-ended block instead of a
     /// closed entry.
+    /// Open the add-entry modal, prefilled with now and, in week view, the
+    /// currently selected day (falling back to today if the week has no
+    /// days to select yet). Leaving the end field blank on submit starts an
+    /// open-ended block instead of a closed entry.
     fn open_add(&mut self) {
+        let date = match self.view {
+            View::Week => self
+                .visible_days()
+                .get(self.selected)
+                .copied()
+                .unwrap_or_else(|| self.today()),
+            View::Today => self.today(),
+        };
         self.mode = Mode::Modal(ModalState {
             kind: ModalKind::AddEdit,
             editing_id: None,
-            date_buf: self.today().to_string(),
+            date_buf: date.to_string(),
             start_buf: Local::now().time().format("%H:%M").to_string(),
             end_buf: String::new(),
             time_buf: String::new(),
@@ -911,7 +923,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 View::Today => {
                     "q quit | a add | f finish | e edit | d delete | j/k move | Tab view | r reload"
                 }
-                View::Week => "q quit | a add | f finish | j/k move | Tab view | r reload",
+                View::Week => {
+                    "q quit | a add to this day | f finish | j/k move | Tab view | r reload"
+                }
             };
             Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
         }
