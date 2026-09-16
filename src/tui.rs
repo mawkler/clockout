@@ -54,10 +54,9 @@ enum StatusKind {
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum ModalKind {
-    /// Full 3-field add/edit form (date, start, end).
+    /// Full 3-field add/edit form (date, start, end). Leaving end blank
+    /// starts an open-ended block instead of a closed one.
     AddEdit,
-    /// Single time field: start an open-ended block.
-    Start,
     /// Single time field: close the currently open block.
     End,
 }
@@ -68,9 +67,9 @@ struct ModalState {
     date_buf: String,
     start_buf: String,
     end_buf: String,
-    /// The single time field used by Start/End modals.
+    /// The single time field used by the End modal.
     time_buf: String,
-    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for Start/End
+    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End
     /// True while the focused field's existing text hasn't been touched yet:
     /// it renders as selected, and the next keystroke overwrites it instead
     /// of appending (like a browser text input). Reset on every focus
@@ -169,12 +168,15 @@ impl App {
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
     }
 
+    /// Open the add-entry modal, prefilled with today and now. Leaving the
+    /// end field blank on submit starts an open-ended block instead of a
+    /// closed entry.
     fn open_add(&mut self) {
         self.mode = Mode::Modal(ModalState {
             kind: ModalKind::AddEdit,
             editing_id: None,
             date_buf: self.today().to_string(),
-            start_buf: String::new(),
+            start_buf: Local::now().time().format("%H:%M").to_string(),
             end_buf: String::new(),
             time_buf: String::new(),
             focus: 1,
@@ -202,39 +204,13 @@ impl App {
         }
     }
 
-    /// Open the "start an open-ended block" modal, prefilled with now.
-    /// Refuses if a block is already open.
-    fn open_start(&mut self) {
-        if let Some(open) = calc::open_entry(&self.entries) {
-            self.status = Some((
-                StatusKind::Error,
-                format!(
-                    "already have an open block from {} - press f to finish it",
-                    open.start.format("%H:%M")
-                ),
-            ));
-            return;
-        }
-        self.mode = Mode::Modal(ModalState {
-            kind: ModalKind::Start,
-            editing_id: None,
-            date_buf: String::new(),
-            start_buf: String::new(),
-            end_buf: String::new(),
-            time_buf: Local::now().time().format("%H:%M").to_string(),
-            focus: 0,
-            field_selected: true,
-            error: None,
-        });
-    }
-
     /// Open the "finish the open block" modal, prefilled with now. Refuses
     /// if there is no open block.
     fn open_finish(&mut self) {
         if calc::open_entry(&self.entries).is_none() {
             self.status = Some((
                 StatusKind::Error,
-                "no open block to finish - press s to start one".to_string(),
+                "no open block to finish - press a to start one".to_string(),
             ));
             return;
         }
@@ -258,11 +234,14 @@ impl App {
         };
         match kind {
             ModalKind::AddEdit => self.submit_add_edit(),
-            ModalKind::Start => self.submit_start(),
             ModalKind::End => self.submit_end(),
         }
     }
 
+    /// Submits the add/edit modal. An empty end field means "still going" -
+    /// it starts (or, when editing, re-opens) a block instead of closing
+    /// one. An empty start field is always an error: a block needs a start
+    /// before it can have an end.
     fn submit_add_edit(&mut self) -> Result<()> {
         let Mode::Modal(m) = &self.mode else {
             return Ok(());
@@ -285,23 +264,31 @@ impl App {
             }
         };
 
-        let start = parse::parse_time(&m.start_buf);
-        let start = match start {
+        if m.start_buf.trim().is_empty() {
+            self.set_modal_error("start time is required".to_string());
+            return Ok(());
+        }
+        let start = match parse::parse_time(&m.start_buf) {
             Ok(s) => s,
             Err(e) => {
                 self.set_modal_error(e);
                 return Ok(());
             }
         };
-        let end = parse::parse_time(&m.end_buf);
-        let end = match end {
-            Ok(e) => e,
-            Err(e) => {
-                self.set_modal_error(e);
-                return Ok(());
+        let end = if m.end_buf.trim().is_empty() {
+            None
+        } else {
+            match parse::parse_time(&m.end_buf) {
+                Ok(e) => Some(e),
+                Err(e) => {
+                    self.set_modal_error(e);
+                    return Ok(());
+                }
             }
         };
-        if start >= end {
+        if let Some(end) = end
+            && start >= end
+        {
             self.set_modal_error("start must be before end".to_string());
             return Ok(());
         }
@@ -311,7 +298,7 @@ impl App {
             id: editing_id.unwrap_or(0),
             date,
             start,
-            end: Some(end),
+            end,
         };
 
         if let Some(conflict) = self.entries.iter().find(|e| {
@@ -331,7 +318,7 @@ impl App {
             if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
                 existing.date = date;
                 existing.start = start;
-                existing.end = Some(end);
+                existing.end = end;
             }
         } else {
             let id = data.next_id;
@@ -340,68 +327,13 @@ impl App {
                 id,
                 date,
                 start,
-                end: Some(end),
+                end,
             });
         }
         storage::save_entries(&data)?;
         self.entries = data.entries;
         self.mode = Mode::Normal;
         self.status = Some((StatusKind::Info, "saved".to_string()));
-        Ok(())
-    }
-
-    fn submit_start(&mut self) -> Result<()> {
-        let Mode::Modal(m) = &self.mode else {
-            return Ok(());
-        };
-        let time = match parse::parse_time(&m.time_buf) {
-            Ok(t) => t,
-            Err(e) => {
-                self.set_modal_error(e);
-                return Ok(());
-            }
-        };
-        if calc::open_entry(&self.entries).is_some() {
-            self.set_modal_error("already have an open block".to_string());
-            return Ok(());
-        }
-        let today = self.today();
-        let candidate = TimeEntry {
-            id: 0,
-            date: today,
-            start: time,
-            end: None,
-        };
-        if let Some(conflict) = self
-            .entries
-            .iter()
-            .find(|e| e.date == today && calc::overlaps(e, &candidate))
-        {
-            self.set_modal_error(format!(
-                "overlaps existing entry #{} ({}-{})",
-                conflict.id,
-                conflict.start.format("%H:%M"),
-                calc::format_end(conflict.end)
-            ));
-            return Ok(());
-        }
-
-        let mut data = storage::load_entries()?;
-        let id = data.next_id;
-        data.next_id += 1;
-        data.entries.push(TimeEntry {
-            id,
-            date: today,
-            start: time,
-            end: None,
-        });
-        storage::save_entries(&data)?;
-        self.entries = data.entries;
-        self.mode = Mode::Normal;
-        self.status = Some((
-            StatusKind::Info,
-            format!("started at {}", time.format("%H:%M")),
-        ));
         Ok(())
     }
 
@@ -526,7 +458,6 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         Mode::Normal => match code {
             KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
             KeyCode::Char('a') => app.open_add(),
-            KeyCode::Char('s') => app.open_start(),
             KeyCode::Char('f') => app.open_finish(),
             KeyCode::Char('e') if app.view == View::Today => app.open_edit(),
             KeyCode::Char('d') if app.view == View::Today => app.request_delete(),
@@ -554,7 +485,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
         Mode::Modal(m) => {
             let field_count = match m.kind {
                 ModalKind::AddEdit => 3,
-                ModalKind::Start | ModalKind::End => 1,
+                ModalKind::End => 1,
             };
             match code {
                 KeyCode::Esc => app.mode = Mode::Normal,
@@ -598,7 +529,7 @@ fn current_buf(m: &mut ModalState) -> &mut String {
             1 => &mut m.start_buf,
             _ => &mut m.end_buf,
         },
-        ModalKind::Start | ModalKind::End => &mut m.time_buf,
+        ModalKind::End => &mut m.time_buf,
     }
 }
 
@@ -978,11 +909,9 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         None => {
             let hint = match app.view {
                 View::Today => {
-                    "q quit | a add | s start | f finish | e edit | d delete | j/k move | Tab view | r reload"
+                    "q quit | a add | f finish | e edit | d delete | j/k move | Tab view | r reload"
                 }
-                View::Week => {
-                    "q quit | a add | s start | f finish | j/k move | Tab view | r reload"
-                }
+                View::Week => "q quit | a add | f finish | j/k move | Tab view | r reload",
             };
             Paragraph::new(Span::styled(hint, Style::default().fg(MUTED)))
         }
@@ -1029,7 +958,6 @@ fn field_line(label: &str, value: &str, focused: bool, field_selected: bool) -> 
 fn draw_modal(f: &mut Frame, m: &ModalState) {
     match m.kind {
         ModalKind::AddEdit => draw_add_edit_modal(f, m),
-        ModalKind::Start => draw_time_modal(f, m, " Start block ", "Start time (HH:MM)"),
         ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time (HH:MM)"),
     }
 }
@@ -1078,7 +1006,7 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
     );
     f.render_widget(
         Paragraph::new(field_line(
-            "End   (HH:MM)",
+            "End (HH:MM, blank = still going)",
             &m.end_buf,
             m.focus == 2,
             m.field_selected,
