@@ -88,11 +88,15 @@ pub fn minutes_left_week(
     (weekly_goal_minutes(cfg) - worked).max(0)
 }
 
-/// Net shortfall from days that have already fully elapsed before `today`
-/// (each expected to hit its own daily target; a day worked past target
-/// offsets shortfall from another day net), reduced live by any surplus
-/// already worked today - so it can clear before the day is over, as soon
-/// as today's extra hours are enough to pay it off. Not yet having worked
+/// Net shortfall from every day that has already fully elapsed before
+/// `today`, going all the way back to the earliest logged entry (not just
+/// the current week) - each day expected to hit its own daily target, with
+/// a day worked past target offsetting shortfall from another day, in any
+/// week, net. Unlike `minutes_left_week`, this does not reset at the start
+/// of a new week: unpaid shortfall from a prior week carries forward until
+/// later surplus days pay it off. Reduced live by any surplus already
+/// worked today - so it can clear before the day is over, as soon as
+/// today's extra hours are enough to pay it off. Not yet having worked
 /// today's own target isn't held against you here (that's what
 /// `minutes_left_today` / `leave_time` already show); only hours worked
 /// *past* it count. Clamped to 0 (never negative).
@@ -102,9 +106,9 @@ pub fn time_debt_minutes(
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
-    let (week_start, _) = week_bounds(today);
+    let start = entries.iter().map(|e| e.date).min().unwrap_or(today);
     let mut historical = 0;
-    let mut day = week_start;
+    let mut day = start;
     while day < today {
         let worked = worked_minutes(&entries_on(entries, day), today, now);
         historical += daily_target_minutes(cfg, day) - worked;
@@ -432,6 +436,46 @@ mod tests {
         // the debt, without ever calling `clockout end`.
         let now_later = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
         assert_eq!(time_debt_minutes(&entries, &c, friday, now_later), 0);
+    }
+
+    #[test]
+    fn time_debt_carries_shortfall_into_new_week() {
+        let c = cfg(40.0, 30); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 8, 31), "08:00", "16:00"), // Mon wk1, 8h, on target
+            entry(2, date(2026, 9, 1), "08:00", "13:00"),  // Tue wk1, 5h, deficit 3h (180min)
+            entry(3, date(2026, 9, 2), "08:00", "16:00"),  // Wed wk1, 8h, on target
+            entry(4, date(2026, 9, 3), "08:00", "16:00"),  // Thu wk1, 8h, on target
+            entry(5, date(2026, 9, 4), "08:00", "16:00"),  // Fri wk1, 8h, on target
+        ];
+        // New week (Monday), nothing logged yet today. The old week-anchored
+        // logic would read 0 here; Tuesday's shortfall from last week
+        // should still show.
+        let monday_week2 = date(2026, 9, 7);
+        assert_eq!(
+            time_debt_minutes(&entries, &c, monday_week2, end_of_day()),
+            180
+        );
+    }
+
+    #[test]
+    fn time_debt_paid_off_by_surplus_in_a_later_week() {
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 8, 31), "08:00", "16:00"), // Mon wk1, 8h, on target
+            entry(2, date(2026, 9, 1), "08:00", "13:00"),  // Tue wk1, 5h, deficit 3h (180min)
+            entry(3, date(2026, 9, 2), "08:00", "16:00"),  // Wed wk1, 8h, on target
+            entry(4, date(2026, 9, 3), "08:00", "16:00"),  // Thu wk1, 8h, on target
+            entry(5, date(2026, 9, 4), "08:00", "16:00"),  // Fri wk1, 8h, on target
+            entry(6, date(2026, 9, 7), "08:00", "20:00"),  // Mon wk2, 12h, surplus 4h (240min)
+        ];
+        // A day into week 2, Monday's big surplus more than pays off the
+        // 180min carried over from week 1: debt is fully cleared.
+        let tuesday_week2 = date(2026, 9, 8);
+        assert_eq!(
+            time_debt_minutes(&entries, &c, tuesday_week2, end_of_day()),
+            0
+        );
     }
 
     #[test]
