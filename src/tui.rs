@@ -621,7 +621,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64) {
         calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start), today, now);
     let goal_week = calc::weekly_goal_minutes(&app.config);
     let left_week = calc::minutes_left_week(&app.entries, &app.config, today, now);
-    let clear_debt_by = calc::leave_time_week(&app.entries, &app.config, today, now);
+    let clear_debt_by = calc::leave_time_debt(&app.entries, &app.config, today, now);
 
     let label = Style::default().fg(LABEL);
     let value = Style::default().add_modifier(Modifier::BOLD);

@@ -154,16 +154,18 @@ pub fn leave_time(
     )
 }
 
-/// Leave time if today should also pay off the rest of the week's shortfall
-/// (any prior days under target), not just today's own even split.
-pub fn leave_time_week(
+/// Clock time you'd need to work until today to pay off the current time
+/// debt specifically (see `time_debt_minutes`) - not the whole week's
+/// remaining goal, just the carried-forward shortfall. Same
+/// break-projection rule as `leave_time`.
+pub fn leave_time_debt(
     entries: &[TimeEntry],
     cfg: &Config,
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
     leave_time_after(
-        minutes_left_week(entries, cfg, today, now),
+        time_debt_minutes(entries, cfg, today, now),
         entries,
         cfg,
         today,
@@ -541,41 +543,30 @@ mod tests {
     }
 
     #[test]
-    fn leave_time_week_pays_off_prior_shortfall() {
-        let c = cfg(40.0, 0);
-        // Monday-Thursday only 4h/day logged (target 8h/day => 16h shortfall).
-        let monday = date(2026, 9, 7);
-        let mut entries = vec![
-            entry(1, monday, "08:00", "12:00"),
-            entry(2, date(2026, 9, 8), "08:00", "12:00"),
-            entry(3, date(2026, 9, 9), "08:00", "12:00"),
-            entry(4, date(2026, 9, 10), "08:00", "12:00"),
+    fn leave_time_debt_reflects_only_the_debt_not_the_whole_week() {
+        let c = cfg(40.0, 0); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "13:00"), // Mon 5h, deficit 3h (180min)
+            entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
         ];
-        let friday = date(2026, 9, 11);
-        entries.push(entry(5, friday, "08:00", "12:00")); // 4h today too
-        let now = NaiveTime::parse_from_str("12:00", "%H:%M").unwrap();
-
-        // Today-only target (8h/day): 4h left.
+        // Wednesday, midday: 3h owed from Monday, nothing worked yet today.
+        // Full week left would be ~19h (goal 40h - 13h worked so far) - this
+        // should be just now + the 180min debt, nowhere close to that.
+        let wednesday = date(2026, 9, 9);
+        let now = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
         assert_eq!(
-            leave_time(&entries, &c, friday, now),
-            NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
-        );
-        // Full week (40h goal, 20h worked so far): 20h left, wraps past midnight.
-        assert_eq!(
-            leave_time_week(&entries, &c, friday, now),
-            NaiveTime::parse_from_str("08:00", "%H:%M").unwrap()
+            leave_time_debt(&entries, &c, wednesday, now),
+            NaiveTime::parse_from_str("17:00", "%H:%M").unwrap()
         );
     }
 
     #[test]
-    fn leave_time_week_matches_today_when_week_goal_already_met() {
-        let c = cfg(10.0, 0);
-        let monday = date(2026, 9, 7);
-        // Week goal (10h) already met on Monday alone; nothing owed today.
-        let entries = vec![entry(1, monday, "08:00", "18:00")];
-        let friday = date(2026, 9, 11);
+    fn leave_time_debt_matches_now_when_no_debt() {
+        let c = cfg(40.0, 0);
+        let d = date(2026, 9, 7);
+        let entries = vec![entry(1, d, "08:00", "16:00")]; // on target, no debt
         let now = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
-        assert_eq!(leave_time_week(&entries, &c, friday, now), now);
+        assert_eq!(leave_time_debt(&entries, &c, d, now), now);
     }
 
     #[test]

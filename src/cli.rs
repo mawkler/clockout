@@ -290,7 +290,7 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     );
     let debt = calc::time_debt_minutes(&data.entries, &cfg, today, now);
     if debt > 0 {
-        let clear_debt_by = calc::leave_time_week(&data.entries, &cfg, today, now);
+        let clear_debt_by = calc::leave_time_debt(&data.entries, &cfg, today, now);
         println!(
             "Time debt: {} · clear by {}",
             calc::format_hm(debt),
