@@ -677,6 +677,13 @@ fn draw_week_diagram(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(p, area);
 }
 
+/// One row in the entries panel: either a real, selectable entry or a
+/// purely descriptive gap/break, ordered chronologically by start time.
+enum DayItem<'a> {
+    Entry(&'a TimeEntry),
+    Gap(NaiveTime, NaiveTime),
+}
+
 /// The entries panel: the focused day's entries and gaps. j/k moves
 /// selection within this list, for e/d.
 fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
@@ -684,27 +691,46 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
     let entries = calc::entries_on(&app.entries, day);
     let gaps = calc::today_gaps(&app.entries, day);
 
+    let mut combined: Vec<DayItem> = entries.into_iter().map(DayItem::Entry).collect();
+    combined.extend(
+        gaps.into_iter()
+            .map(|(start, end)| DayItem::Gap(start, end)),
+    );
+    combined.sort_by_key(|item| match item {
+        DayItem::Entry(e) => e.start,
+        DayItem::Gap(start, _) => *start,
+    });
+
+    // app.selected indexes app.visible() (entries only, sorted the same
+    // way); track which row of the combined, gap-interleaved list that
+    // lands on so the highlight stays on the right entry.
     let mut items: Vec<ListItem> = Vec::new();
-    for e in &entries {
-        let range_style = if e.end.is_none() {
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        };
-        items.push(ListItem::new(Span::styled(
-            format!("{}-{}", e.start.format("%H:%M"), calc::format_end(e.end)),
-            range_style,
-        )));
-    }
-    for (start, end) in gaps {
-        items.push(ListItem::new(Span::styled(
-            format!(
-                "{}-{} (gap/break)",
-                start.format("%H:%M"),
-                end.format("%H:%M")
-            ),
-            Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
-        )));
+    let mut select_index = None;
+    let mut entry_count = 0;
+    for item in &combined {
+        match item {
+            DayItem::Entry(e) => {
+                if entry_count == app.selected {
+                    select_index = Some(items.len());
+                }
+                entry_count += 1;
+                let range_style = if e.end.is_none() {
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                items.push(ListItem::new(Span::styled(
+                    format!("{}-{}", e.start.format("%H:%M"), calc::format_end(e.end)),
+                    range_style,
+                )));
+            }
+            DayItem::Gap(start, end) => {
+                items.push(ListItem::new(Span::styled(
+                    format!("{}-{} (break)", start.format("%H:%M"), end.format("%H:%M")),
+                    Style::default().fg(MUTED).add_modifier(Modifier::ITALIC),
+                )));
+            }
+        }
     }
     let no_entries = items.is_empty();
     let items = if no_entries {
@@ -717,9 +743,8 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut state = ListState::default();
-    let len = app.visible().len();
-    if len > 0 {
-        state.select(Some(app.selected.min(len - 1)));
+    if entry_count > 0 {
+        state.select(select_index);
     }
 
     // Dimmed (bold only, no reverse) while the Days pane has focus instead
@@ -865,14 +890,15 @@ fn day_bar(
 
     let open = entries.iter().find(|e| e.end.is_none());
     let open_end = open.map(|_| if day == today { now } else { window_end });
+    let is_open_worked = |t: NaiveTime| {
+        open.zip(open_end)
+            .is_some_and(|(o, oe)| o.start <= t && t < oe)
+    };
 
     let mut cells: Vec<Cell> = (0..width)
         .map(|c| {
             let t = col_time(c);
-            let open_worked = open
-                .zip(open_end)
-                .is_some_and(|(o, oe)| o.start <= t && t < oe);
-            if is_closed_worked(t) || open_worked {
+            if is_closed_worked(t) || is_open_worked(t) {
                 Cell::Worked
             } else {
                 Cell::Empty
@@ -880,13 +906,12 @@ fn day_bar(
         })
         .collect();
 
-    if let (Some(open), Some(open_end)) = (open, open_end)
-        && open.start < open_end
-    {
-        let offset = (open_end - window_start)
-            .num_minutes()
-            .clamp(0, total_minutes);
-        let boundary = (((offset * width as i64) / total_minutes) as usize).min(width - 1);
+    // The fade's last glyph must land on the same column the loop above
+    // already marked as the open block's final worked column - so find it
+    // by the identical predicate, rather than re-deriving a column from a
+    // time offset (that inverse isn't exact under integer truncation and
+    // could land one column short, leaving a stray solid cell past the fade).
+    if let Some(boundary) = (0..width).rev().find(|&c| is_open_worked(col_time(c))) {
         for stage in 0..FADE.len() {
             let back = FADE.len() - 1 - stage;
             if let Some(c) = boundary.checked_sub(back)

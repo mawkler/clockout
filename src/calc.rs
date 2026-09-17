@@ -155,22 +155,22 @@ pub fn leave_time(
 }
 
 /// Clock time you'd need to work until today to pay off the current time
-/// debt specifically (see `time_debt_minutes`) - not the whole week's
-/// remaining goal, just the carried-forward shortfall. Same
-/// break-projection rule as `leave_time`.
+/// debt (see `time_debt_minutes`) on top of today's own target - not the
+/// whole week's remaining goal, just today's target plus the
+/// carried-forward shortfall. `time_debt_minutes` only nets *surplus*
+/// (hours worked past today's own target) against the debt, so paying it
+/// off is never faster than `leave_time` alone: you hit today's target
+/// first, and only time worked beyond that starts counting toward the
+/// debt. Same break-projection rule as `leave_time`.
 pub fn leave_time_debt(
     entries: &[TimeEntry],
     cfg: &Config,
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
-    leave_time_after(
-        time_debt_minutes(entries, cfg, today, now),
-        entries,
-        cfg,
-        today,
-        now,
-    )
+    let minutes_owed =
+        minutes_left_today(entries, cfg, today, now) + time_debt_minutes(entries, cfg, today, now);
+    leave_time_after(minutes_owed, entries, cfg, today, now)
 }
 
 fn leave_time_after(
@@ -543,29 +543,53 @@ mod tests {
     }
 
     #[test]
-    fn leave_time_debt_reflects_only_the_debt_not_the_whole_week() {
+    fn leave_time_debt_adds_debt_on_top_of_todays_own_target() {
         let c = cfg(40.0, 0); // 8h/day target
         let entries = vec![
             entry(1, date(2026, 9, 7), "08:00", "13:00"), // Mon 5h, deficit 3h (180min)
             entry(2, date(2026, 9, 8), "08:00", "16:00"), // Tue 8h, on target
         ];
-        // Wednesday, midday: 3h owed from Monday, nothing worked yet today.
-        // Full week left would be ~19h (goal 40h - 13h worked so far) - this
-        // should be just now + the 180min debt, nowhere close to that.
+        // Wednesday, midday: 3h owed from Monday, nothing worked yet today -
+        // so today's own 8h target is still fully outstanding too. Debt only
+        // starts paying down once today's target is met (time_debt_minutes
+        // nets *surplus* against it), so this is now + 8h target + 3h debt,
+        // not just now + the 180min debt in isolation.
         let wednesday = date(2026, 9, 9);
         let now = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
         assert_eq!(
             leave_time_debt(&entries, &c, wednesday, now),
-            NaiveTime::parse_from_str("17:00", "%H:%M").unwrap()
+            NaiveTime::parse_from_str("01:00", "%H:%M").unwrap() // wraps past midnight
         );
     }
 
     #[test]
-    fn leave_time_debt_matches_now_when_no_debt() {
+    fn leave_time_debt_equals_leave_time_plus_debt() {
+        // Directly encodes the intended relationship: clearing the debt
+        // never happens before you'd otherwise leave for the day - it's
+        // that same leave time, plus the debt on top.
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "14:20"), // Mon 6h20m, deficit 1h40m
+            open(2, date(2026, 9, 8), "09:05"),           // Tue: open block since 09:05
+        ];
+        let tuesday = date(2026, 9, 8);
+        let now = NaiveTime::parse_from_str("10:23", "%H:%M").unwrap();
+        let debt = time_debt_minutes(&entries, &c, tuesday, now);
+        assert!(debt > 0, "test needs a nonzero debt to be meaningful");
+        assert_eq!(
+            leave_time_debt(&entries, &c, tuesday, now),
+            leave_time(&entries, &c, tuesday, now) + Duration::minutes(debt)
+        );
+    }
+
+    #[test]
+    fn leave_time_debt_matches_now_when_no_debt_and_todays_target_met() {
         let c = cfg(40.0, 0);
         let d = date(2026, 9, 7);
-        let entries = vec![entry(1, d, "08:00", "16:00")]; // on target, no debt
-        let now = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
+        // Entry's end already reached by `now`, so it's fully credited:
+        // today's target is exactly met (0 left) and there's no debt.
+        let entries = vec![entry(1, d, "08:00", "16:00")];
+        let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
         assert_eq!(leave_time_debt(&entries, &c, d, now), now);
     }
 
