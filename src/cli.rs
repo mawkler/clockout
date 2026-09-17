@@ -10,7 +10,7 @@ use crate::storage;
 #[command(
     name = "clockout",
     version,
-    about = "Track weekly work hours against a goal"
+    about = "CLI and TUI to track worked hours against a weekly goal, and see what time you can leave for the day"
 )]
 pub struct Cli {
     #[command(subcommand)]
