@@ -568,7 +568,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let now = Local::now().time();
     let target_today = calc::daily_target_minutes(&app.config, today);
-    let mut spans = if target_today == 0 {
+    let spans = if target_today == 0 {
         let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
         vec![
             Span::styled(
@@ -593,15 +593,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     };
-    if let Some(open) = calc::open_entry(&app.entries)
-        && open.date == today
-    {
-        spans.push(Span::styled("  ·  open since ", Style::default().fg(LABEL)));
-        spans.push(Span::styled(
-            open.start.format("%H:%M").to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-    }
     let block = gray_block(format!(" {} ({}) ", today, today.format("%A")));
     let p = Paragraph::new(Line::from(spans))
         .alignment(Alignment::Center)
