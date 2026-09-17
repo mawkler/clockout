@@ -34,22 +34,22 @@ impl Default for EntriesFile {
     }
 }
 
-fn default_future_break() -> u32 {
+fn default_estimated_lunch_break() -> u32 {
     30
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub weekly_goal_hours: f64,
-    #[serde(default = "default_future_break")]
-    pub future_break_minutes: u32,
+    #[serde(default = "default_estimated_lunch_break")]
+    pub estimated_lunch_break_minutes: u32,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Config {
             weekly_goal_hours: 40.0,
-            future_break_minutes: default_future_break(),
+            estimated_lunch_break_minutes: default_estimated_lunch_break(),
         }
     }
 }

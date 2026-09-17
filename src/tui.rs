@@ -300,39 +300,47 @@ impl App {
             end,
         };
 
-        if let Some(conflict) = self.entries.iter().find(|e| {
-            e.date == candidate.date && Some(e.id) != editing_id && calc::overlaps(e, &candidate)
-        }) {
-            self.set_modal_error(format!(
-                "overlaps existing entry #{} ({}-{})",
-                conflict.id,
-                conflict.start.format("%H:%M"),
-                calc::format_end(conflict.end)
-            ));
-            return Ok(());
-        }
-
-        let mut data = storage::load_entries()?;
-        if let Some(id) = editing_id {
-            if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
-                existing.date = date;
-                existing.start = start;
-                existing.end = end;
+        let result = storage::with_entries(|data| {
+            if let Some(conflict) = data.entries.iter().find(|e| {
+                e.date == candidate.date
+                    && Some(e.id) != editing_id
+                    && calc::overlaps(e, &candidate)
+            }) {
+                anyhow::bail!(
+                    "overlaps existing entry #{} ({}-{})",
+                    conflict.id,
+                    conflict.start.format("%H:%M"),
+                    calc::format_end(conflict.end)
+                );
             }
-        } else {
-            let id = data.next_id;
-            data.next_id += 1;
-            data.entries.push(TimeEntry {
-                id,
-                date,
-                start,
-                end,
-            });
+
+            if let Some(id) = editing_id {
+                if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
+                    existing.date = date;
+                    existing.start = start;
+                    existing.end = end;
+                }
+            } else {
+                let id = data.next_id;
+                data.next_id += 1;
+                data.entries.push(TimeEntry {
+                    id,
+                    date,
+                    start,
+                    end,
+                });
+            }
+            Ok(data.entries.clone())
+        });
+
+        match result {
+            Ok(entries) => {
+                self.entries = entries;
+                self.mode = Mode::Normal;
+                self.status = Some((StatusKind::Info, "saved".to_string()));
+            }
+            Err(e) => self.set_modal_error(e.to_string()),
         }
-        storage::save_entries(&data)?;
-        self.entries = data.entries;
-        self.mode = Mode::Normal;
-        self.status = Some((StatusKind::Info, "saved".to_string()));
         Ok(())
     }
 
@@ -347,41 +355,47 @@ impl App {
                 return Ok(());
             }
         };
-        let Some(open) = calc::open_entry(&self.entries) else {
-            self.set_modal_error("no open block".to_string());
-            return Ok(());
-        };
-        if time <= open.start {
-            self.set_modal_error("end must be after start".to_string());
-            return Ok(());
-        }
-        let (id, date, start) = (open.id, open.date, open.start);
-        let candidate = TimeEntry {
-            id,
-            date,
-            start,
-            end: Some(time),
-        };
-        if let Some(conflict) = self
-            .entries
-            .iter()
-            .find(|e| e.id != id && e.date == date && calc::overlaps(e, &candidate))
-        {
-            self.set_modal_error(format!(
-                "overlaps existing entry #{} ({}-{})",
-                conflict.id,
-                conflict.start.format("%H:%M"),
-                calc::format_end(conflict.end)
-            ));
-            return Ok(());
-        }
+        let result = storage::with_entries(|data| {
+            let Some(open) = calc::open_entry(&data.entries) else {
+                anyhow::bail!("no open block");
+            };
+            if time <= open.start {
+                anyhow::bail!("end must be after start");
+            }
+            let (id, date, start) = (open.id, open.date, open.start);
+            let candidate = TimeEntry {
+                id,
+                date,
+                start,
+                end: Some(time),
+            };
+            if let Some(conflict) = data
+                .entries
+                .iter()
+                .find(|e| e.id != id && e.date == date && calc::overlaps(e, &candidate))
+            {
+                anyhow::bail!(
+                    "overlaps existing entry #{} ({}-{})",
+                    conflict.id,
+                    conflict.start.format("%H:%M"),
+                    calc::format_end(conflict.end)
+                );
+            }
 
-        let mut data = storage::load_entries()?;
-        if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
-            existing.end = Some(time);
-        }
-        storage::save_entries(&data)?;
-        self.entries = data.entries;
+            if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
+                existing.end = Some(time);
+            }
+            Ok((data.entries.clone(), start))
+        });
+
+        let (entries, start) = match result {
+            Ok(v) => v,
+            Err(e) => {
+                self.set_modal_error(e.to_string());
+                return Ok(());
+            }
+        };
+        self.entries = entries;
         self.mode = Mode::Normal;
         self.status = Some((
             StatusKind::Info,
@@ -407,10 +421,11 @@ impl App {
     }
 
     fn confirm_delete(&mut self, id: u64) -> Result<()> {
-        let mut data = storage::load_entries()?;
-        data.entries.retain(|e| e.id != id);
-        storage::save_entries(&data)?;
-        self.entries = data.entries;
+        let entries = storage::with_entries(|data| {
+            data.entries.retain(|e| e.id != id);
+            Ok(data.entries.clone())
+        })?;
+        self.entries = entries;
         self.mode = Mode::Normal;
         self.status = Some((StatusKind::Info, format!("deleted #{id}")));
         Ok(())

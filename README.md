@@ -21,7 +21,7 @@ Configuration in `~/.config/clockout/config.toml`. For example:
 
 ```toml
 weekly_goal_hours = 40.0  # Target hours to work every week
-future_break_minutes = 30 # Assumed lunch break time, used for estimation
+estimated_lunch_break_minutes = 30 # Assumed lunch break time, used for estimation
 ```
 
 ## LLM disclosure

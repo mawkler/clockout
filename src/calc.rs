@@ -2,20 +2,21 @@ use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
 use crate::model::{Config, TimeEntry};
 
-/// Minutes worked by this entry as of `now`. An entry never gets credit for
-/// time that hasn't happened yet: if it's today's entry and its end (stored,
-/// or - for a still-open entry - the implicit end of day) is later than
-/// `now`, only the portion up to `now` counts. A day-in-the-past entry
-/// always counts its full stored (or through-end-of-day, if open) duration,
-/// since `now` can't meaningfully bound a day that's already over. Never
-/// negative - a block that hasn't started yet as of `now` contributes 0.
+/// Minutes worked by this entry as of `now`. A closed entry (it has a
+/// stored end) always counts in full, whatever that end is - even one
+/// later than `now` - since closing a block is an explicit declaration
+/// that the work happened, taken at face value. Only a still-open entry
+/// (no end yet) accrues live and never gets credit for time that hasn't
+/// happened: it's capped at `now` if it's today's entry, or through the
+/// implicit end of day if it was left open on a past day (since `now`
+/// can't meaningfully bound a day that's already over). Never negative -
+/// a block that hasn't started yet as of its effective end contributes 0.
 pub fn entry_minutes(e: &TimeEntry, today: NaiveDate, now: NaiveTime) -> i64 {
     let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
-    let raw_end = e.end.unwrap_or(end_of_day);
-    let effective_end = if e.date == today {
-        raw_end.min(now)
-    } else {
-        raw_end
+    let effective_end = match e.end {
+        Some(end) => end,
+        None if e.date == today => now,
+        None => end_of_day,
     };
     (effective_end - e.start).num_minutes().max(0)
 }
@@ -137,8 +138,8 @@ pub fn today_gaps(entries: &[TimeEntry], day: NaiveDate) -> Vec<(NaiveTime, Naiv
 
 /// Projected clock time the user can leave today, assuming no further breaks
 /// beyond what's already implied by logged entries. If today has no logged
-/// gap yet, `future_break_minutes` from config is added as an anticipated
-/// break; once a real gap is logged, it supersedes the guess.
+/// gap yet, `estimated_lunch_break_minutes` from config is added as an
+/// anticipated break; once a real gap is logged, it supersedes the guess.
 pub fn leave_time(
     entries: &[TimeEntry],
     cfg: &Config,
@@ -181,7 +182,7 @@ fn leave_time_after(
     now: NaiveTime,
 ) -> NaiveTime {
     let projected_break = if today_gaps(entries, today).is_empty() {
-        cfg.future_break_minutes as i64
+        cfg.estimated_lunch_break_minutes as i64
     } else {
         0
     };
@@ -247,10 +248,10 @@ mod tests {
         NaiveTime::from_hms_opt(23, 59, 59).unwrap()
     }
 
-    fn cfg(goal: f64, future_break: u32) -> Config {
+    fn cfg(goal: f64, lunch_break: u32) -> Config {
         Config {
             weekly_goal_hours: goal,
-            future_break_minutes: future_break,
+            estimated_lunch_break_minutes: lunch_break,
         }
     }
 
@@ -533,7 +534,7 @@ mod tests {
     }
 
     #[test]
-    fn leave_time_zero_future_break_no_padding() {
+    fn leave_time_zero_lunch_break_no_padding() {
         let c = cfg(40.0, 0);
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00")]; // 4h worked, 4h left
@@ -648,20 +649,22 @@ mod tests {
     }
 
     #[test]
-    fn entry_minutes_closed_future_end_caps_at_now() {
+    fn entry_minutes_closed_future_end_counts_in_full() {
         let d = date(2026, 9, 11);
-        // Logged 12:35-17:00 in advance, but it's currently only 16:00: only
-        // the portion up to now counts, not the still-future 16:00-17:00.
+        // Closed 12:35-17:00 even though it's currently only 16:00: closing
+        // an entry is a declaration the work happened, trusted at face
+        // value - the whole 4h25m counts, not just up to now.
         let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
-        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 205); // 3h25m
+        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 265); // 4h25m
     }
 
     #[test]
-    fn entry_minutes_closed_entirely_future_is_zero() {
+    fn entry_minutes_closed_entirely_future_counts_in_full() {
         let d = date(2026, 9, 11);
-        // A block logged for later today that hasn't started yet.
+        // A closed block for later today that hasn't started yet still
+        // counts in full - it's closed, so it's trusted regardless of now.
         let now = NaiveTime::parse_from_str("10:00", "%H:%M").unwrap();
-        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 0);
+        assert_eq!(entry_minutes(&entry(1, d, "12:35", "17:00"), d, now), 265); // 4h25m
     }
 
     #[test]
@@ -678,21 +681,21 @@ mod tests {
     }
 
     #[test]
-    fn leave_time_ignores_a_future_logged_end() {
+    fn leave_time_credits_a_future_logged_end_once_closed() {
         let c = cfg(40.0, 0); // 8h/day target
         let d = date(2026, 9, 11);
         // A morning block plus an afternoon block logged in advance, end
-        // still in the future relative to `now`.
+        // still in the future relative to `now` - but closed, so trusted.
         let entries = vec![
-            entry(1, d, "08:40", "12:00"), // 3h20m, fully past
-            entry(2, d, "12:35", "17:00"), // logged through 17:00...
+            entry(1, d, "08:40", "12:00"), // 3h20m
+            entry(2, d, "12:35", "17:00"), // 4h25m, closed through 17:00
         ];
-        // ...but it's only 16:00 right now: only 12:35-16:00 (3h25m) of the
-        // second block counts, not the full 4h25m through 17:00.
+        // It's only 16:00 right now, but both are closed entries: the full
+        // 4h25m of the second block counts, not just up to now.
         let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
-        // worked so far: 3h20m + 3h25m = 6h45m; target 8h -> 1h15m left.
+        // worked: 3h20m + 4h25m = 7h45m; target 8h -> 15m left.
         let leave = leave_time(&entries, &c, d, now);
-        assert_eq!(leave, NaiveTime::parse_from_str("17:15", "%H:%M").unwrap());
+        assert_eq!(leave, NaiveTime::parse_from_str("16:15", "%H:%M").unwrap());
     }
 
     #[test]

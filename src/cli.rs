@@ -99,39 +99,40 @@ fn cmd_log(
     let entry_date = resolve_date(&day, &date, today).map_err(|e| anyhow::anyhow!(e))?;
     let (start, end) = parse::parse_range(&range).map_err(|e| anyhow::anyhow!(e))?;
 
-    let mut data = storage::load_entries()?;
-    if let Some(open) = calc::open_entry(&data.entries) {
-        anyhow::bail!(
-            "open block #{} ({} {}-…) needs `clockout end` first",
-            open.id,
-            open.date,
-            open.start.format("%H:%M")
-        );
-    }
-    let candidate = TimeEntry {
-        id: data.next_id,
-        date: entry_date,
-        start,
-        end: Some(end),
-    };
-    if let Some(conflict) = data
-        .entries
-        .iter()
-        .find(|e| e.date == entry_date && calc::overlaps(e, &candidate))
-    {
-        anyhow::bail!(
-            "range {}-{} overlaps existing entry #{} ({}-{})",
-            start.format("%H:%M"),
-            end.format("%H:%M"),
-            conflict.id,
-            conflict.start.format("%H:%M"),
-            calc::format_end(conflict.end),
-        );
-    }
+    let candidate = storage::with_entries(|data| {
+        if let Some(open) = calc::open_entry(&data.entries) {
+            anyhow::bail!(
+                "open block #{} ({} {}-…) needs `clockout end` first",
+                open.id,
+                open.date,
+                open.start.format("%H:%M")
+            );
+        }
+        let candidate = TimeEntry {
+            id: data.next_id,
+            date: entry_date,
+            start,
+            end: Some(end),
+        };
+        if let Some(conflict) = data
+            .entries
+            .iter()
+            .find(|e| e.date == entry_date && calc::overlaps(e, &candidate))
+        {
+            anyhow::bail!(
+                "range {}-{} overlaps existing entry #{} ({}-{})",
+                start.format("%H:%M"),
+                end.format("%H:%M"),
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end),
+            );
+        }
 
-    data.next_id += 1;
-    data.entries.push(candidate.clone());
-    storage::save_entries(&data)?;
+        data.next_id += 1;
+        data.entries.push(candidate.clone());
+        Ok(candidate)
+    })?;
     println!(
         "logged #{}: {} {}-{}",
         candidate.id,
@@ -148,44 +149,44 @@ fn cmd_start(
     date: Option<NaiveDate>,
     today: NaiveDate,
 ) -> anyhow::Result<()> {
-    let mut data = storage::load_entries()?;
-    if let Some(open) = calc::open_entry(&data.entries) {
-        anyhow::bail!(
-            "already have an open block #{} ({} {}-…) - run `clockout end` first",
-            open.id,
-            open.date,
-            open.start.format("%H:%M")
-        );
-    }
-
     let entry_date = resolve_date(&day, &date, today).map_err(|e| anyhow::anyhow!(e))?;
     let start = match time {
         Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
         None => Local::now().time(),
     };
-    let candidate = TimeEntry {
-        id: data.next_id,
-        date: entry_date,
-        start,
-        end: None,
-    };
-    if let Some(conflict) = data
-        .entries
-        .iter()
-        .find(|e| e.date == entry_date && calc::overlaps(e, &candidate))
-    {
-        anyhow::bail!(
-            "start {} overlaps existing entry #{} ({}-{})",
-            start.format("%H:%M"),
-            conflict.id,
-            conflict.start.format("%H:%M"),
-            calc::format_end(conflict.end),
-        );
-    }
+    let candidate = storage::with_entries(|data| {
+        if let Some(open) = calc::open_entry(&data.entries) {
+            anyhow::bail!(
+                "already have an open block #{} ({} {}-…) - run `clockout end` first",
+                open.id,
+                open.date,
+                open.start.format("%H:%M")
+            );
+        }
+        let candidate = TimeEntry {
+            id: data.next_id,
+            date: entry_date,
+            start,
+            end: None,
+        };
+        if let Some(conflict) = data
+            .entries
+            .iter()
+            .find(|e| e.date == entry_date && calc::overlaps(e, &candidate))
+        {
+            anyhow::bail!(
+                "start {} overlaps existing entry #{} ({}-{})",
+                start.format("%H:%M"),
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end),
+            );
+        }
 
-    data.next_id += 1;
-    data.entries.push(candidate.clone());
-    storage::save_entries(&data)?;
+        data.next_id += 1;
+        data.entries.push(candidate.clone());
+        Ok(candidate)
+    })?;
     println!(
         "started #{}: {} {}-…",
         candidate.id,
@@ -196,51 +197,52 @@ fn cmd_start(
 }
 
 fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
-    let mut data = storage::load_entries()?;
-    let idx = data
-        .entries
-        .iter()
-        .position(|e| e.end.is_none())
-        .ok_or_else(|| anyhow::anyhow!("no open block - run `clockout start` first"))?;
+    let (id, entry_date, start, end) = storage::with_entries(|data| {
+        let idx = data
+            .entries
+            .iter()
+            .position(|e| e.end.is_none())
+            .ok_or_else(|| anyhow::anyhow!("no open block - run `clockout start` first"))?;
 
-    let end = match time {
-        Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
-        None => Local::now().time(),
-    };
-    let (id, entry_date, start) = (
-        data.entries[idx].id,
-        data.entries[idx].date,
-        data.entries[idx].start,
-    );
-    if start >= end {
-        anyhow::bail!(
-            "end {} must be after start {}",
-            end.format("%H:%M"),
-            start.format("%H:%M")
+        let end = match &time {
+            Some(t) => parse::parse_time(t).map_err(|e| anyhow::anyhow!(e))?,
+            None => Local::now().time(),
+        };
+        let (id, entry_date, start) = (
+            data.entries[idx].id,
+            data.entries[idx].date,
+            data.entries[idx].start,
         );
-    }
-    let candidate = TimeEntry {
-        id,
-        date: entry_date,
-        start,
-        end: Some(end),
-    };
-    if let Some(conflict) = data
-        .entries
-        .iter()
-        .find(|e| e.id != id && e.date == entry_date && calc::overlaps(e, &candidate))
-    {
-        anyhow::bail!(
-            "end {} overlaps existing entry #{} ({}-{})",
-            end.format("%H:%M"),
-            conflict.id,
-            conflict.start.format("%H:%M"),
-            calc::format_end(conflict.end),
-        );
-    }
+        if start >= end {
+            anyhow::bail!(
+                "end {} must be after start {}",
+                end.format("%H:%M"),
+                start.format("%H:%M")
+            );
+        }
+        let candidate = TimeEntry {
+            id,
+            date: entry_date,
+            start,
+            end: Some(end),
+        };
+        if let Some(conflict) = data
+            .entries
+            .iter()
+            .find(|e| e.id != id && e.date == entry_date && calc::overlaps(e, &candidate))
+        {
+            anyhow::bail!(
+                "end {} overlaps existing entry #{} ({}-{})",
+                end.format("%H:%M"),
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end),
+            );
+        }
 
-    data.entries[idx].end = Some(end);
-    storage::save_entries(&data)?;
+        data.entries[idx].end = Some(end);
+        Ok((id, entry_date, start, end))
+    })?;
     println!(
         "ended #{}: {} {}-{}",
         id,
@@ -333,40 +335,41 @@ fn cmd_list(all: bool, today: NaiveDate) -> anyhow::Result<()> {
 }
 
 fn cmd_edit(id: u64, range: Option<String>, date: Option<NaiveDate>) -> anyhow::Result<()> {
-    let mut data = storage::load_entries()?;
-    let idx = data
-        .entries
-        .iter()
-        .position(|e| e.id == id)
-        .ok_or_else(|| anyhow::anyhow!("no entry with id {id}"))?;
+    let updated = storage::with_entries(|data| {
+        let idx = data
+            .entries
+            .iter()
+            .position(|e| e.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no entry with id {id}"))?;
 
-    let mut updated = data.entries[idx].clone();
-    if let Some(date) = date {
-        updated.date = date;
-    }
-    if let Some(range) = range {
-        let (start, end) = parse::parse_range(&range).map_err(|e| anyhow::anyhow!(e))?;
-        updated.start = start;
-        updated.end = Some(end);
-    }
+        let mut updated = data.entries[idx].clone();
+        if let Some(date) = date {
+            updated.date = date;
+        }
+        if let Some(range) = &range {
+            let (start, end) = parse::parse_range(range).map_err(|e| anyhow::anyhow!(e))?;
+            updated.start = start;
+            updated.end = Some(end);
+        }
 
-    if let Some(conflict) = data
-        .entries
-        .iter()
-        .find(|e| e.id != id && e.date == updated.date && calc::overlaps(e, &updated))
-    {
-        anyhow::bail!(
-            "range {}-{} overlaps existing entry #{} ({}-{})",
-            updated.start.format("%H:%M"),
-            calc::format_end(updated.end),
-            conflict.id,
-            conflict.start.format("%H:%M"),
-            calc::format_end(conflict.end),
-        );
-    }
+        if let Some(conflict) = data
+            .entries
+            .iter()
+            .find(|e| e.id != id && e.date == updated.date && calc::overlaps(e, &updated))
+        {
+            anyhow::bail!(
+                "range {}-{} overlaps existing entry #{} ({}-{})",
+                updated.start.format("%H:%M"),
+                calc::format_end(updated.end),
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end),
+            );
+        }
 
-    data.entries[idx] = updated.clone();
-    storage::save_entries(&data)?;
+        data.entries[idx] = updated.clone();
+        Ok(updated)
+    })?;
     println!(
         "updated #{}: {} {}-{}",
         updated.id,
@@ -378,13 +381,14 @@ fn cmd_edit(id: u64, range: Option<String>, date: Option<NaiveDate>) -> anyhow::
 }
 
 fn cmd_delete(id: u64) -> anyhow::Result<()> {
-    let mut data = storage::load_entries()?;
-    let len_before = data.entries.len();
-    data.entries.retain(|e| e.id != id);
-    if data.entries.len() == len_before {
-        anyhow::bail!("no entry with id {id}");
-    }
-    storage::save_entries(&data)?;
+    storage::with_entries(|data| {
+        let len_before = data.entries.len();
+        data.entries.retain(|e| e.id != id);
+        if data.entries.len() == len_before {
+            anyhow::bail!("no entry with id {id}");
+        }
+        Ok(())
+    })?;
     println!("deleted #{id}");
     Ok(())
 }
