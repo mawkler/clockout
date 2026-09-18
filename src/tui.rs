@@ -749,7 +749,11 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
     };
 
     let mut state = ListState::default();
-    if entry_count > 0 {
+    if no_entries {
+        // Highlight the placeholder itself, so it's clear this pane (not
+        // the week diagram) has focus even when there's nothing to select.
+        state.select(Some(0));
+    } else if entry_count > 0 {
         state.select(select_index);
     }
 
