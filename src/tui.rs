@@ -1,5 +1,5 @@
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate, NaiveTime};
@@ -26,6 +26,10 @@ const LABEL: Color = Color::White;
 const ACCENT: Color = Color::Cyan;
 const DANGER: Color = Color::Red;
 const SUCCESS: Color = Color::Green;
+
+/// How long a footer status message (e.g. "saved") stays up before it's
+/// cleared and the key-hint line reappears underneath.
+const STATUS_DURATION: Duration = Duration::from_secs(2);
 
 fn gray_block(title: impl Into<String>) -> Block<'static> {
     Block::default()
@@ -91,7 +95,9 @@ struct App {
     /// Index into the focused day's entries, for e/d and highlighting.
     selected: usize,
     mode: Mode,
-    status: Option<(StatusKind, String)>,
+    /// A transient footer message and when it was set, for `STATUS_DURATION`
+    /// auto-dismissal - see `set_status`/`clear_expired_status`.
+    status: Option<(StatusKind, String, Instant)>,
     quit: bool,
 }
 
@@ -109,6 +115,20 @@ impl App {
             status: None,
             quit: false,
         })
+    }
+
+    fn set_status(&mut self, kind: StatusKind, message: impl Into<String>) {
+        self.status = Some((kind, message.into(), Instant::now()));
+    }
+
+    /// Clears the footer status once it's been up for `STATUS_DURATION`, so
+    /// the key hints reappear on their own instead of staying hidden.
+    fn clear_expired_status(&mut self) {
+        if let Some((_, _, set_at)) = &self.status
+            && set_at.elapsed() >= STATUS_DURATION
+        {
+            self.status = None;
+        }
     }
 
     fn reload(&mut self) -> Result<()> {
@@ -207,10 +227,10 @@ impl App {
     /// if there is no open block.
     fn open_finish(&mut self) {
         if calc::open_entry(&self.entries).is_none() {
-            self.status = Some((
+            self.set_status(
                 StatusKind::Error,
-                "no open block to finish - press a to start one".to_string(),
-            ));
+                "no open block to finish - press a to start one",
+            );
             return;
         }
         self.mode = Mode::Modal(ModalState {
@@ -337,7 +357,7 @@ impl App {
             Ok(entries) => {
                 self.entries = entries;
                 self.mode = Mode::Normal;
-                self.status = Some((StatusKind::Info, "saved".to_string()));
+                self.set_status(StatusKind::Info, "saved");
             }
             Err(e) => self.set_modal_error(e.to_string()),
         }
@@ -397,14 +417,14 @@ impl App {
         };
         self.entries = entries;
         self.mode = Mode::Normal;
-        self.status = Some((
+        self.set_status(
             StatusKind::Info,
             format!(
                 "finished {}-{}",
                 start.format("%H:%M"),
                 time.format("%H:%M")
             ),
-        ));
+        );
         Ok(())
     }
 
@@ -427,7 +447,7 @@ impl App {
         })?;
         self.entries = entries;
         self.mode = Mode::Normal;
-        self.status = Some((StatusKind::Info, format!("deleted #{id}")));
+        self.set_status(StatusKind::Info, format!("deleted #{id}"));
         Ok(())
     }
 }
@@ -452,6 +472,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let mut app = App::new()?;
 
     while !app.quit {
+        app.clear_expired_status();
         terminal.draw(|f| draw(f, &app))?;
 
         if event::poll(Duration::from_millis(500))? {
@@ -956,7 +977,7 @@ fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let p = match &app.status {
-        Some((kind, s)) => {
+        Some((kind, s, _)) => {
             let color = if *kind == StatusKind::Error {
                 DANGER
             } else {
