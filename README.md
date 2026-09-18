@@ -15,6 +15,11 @@ clockout edit <id> [...]       edit an entry
 clockout delete <id>           delete an entry
 ```
 
+## Build
+
+Standard `cargo build --release`, or with Nix: `nix build` (or `nix run` /
+`nix develop` for a dev shell).
+
 ## Config
 
 Configuration in `~/.config/clockout/config.toml`. For example:
