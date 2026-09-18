@@ -913,23 +913,31 @@ fn day_bar(
         let offset = (c as i64 * total_minutes) / width as i64;
         window_start + chrono::Duration::minutes(offset)
     };
-    let is_closed_worked = |t: NaiveTime| {
-        entries
-            .iter()
-            .any(|e| e.end.is_some_and(|end| e.start <= t && t < end))
+    // Half-open [start, end) time span covered by column `c`. Used instead
+    // of a single sampled point so a span narrower than one column's time
+    // resolution (e.g. a block started a minute ago on a wide window) still
+    // overlaps - and lights up - the column it falls in, rather than only
+    // appearing once elapsed time crosses the next column boundary.
+    let col_range = |c: usize| (col_time(c), col_time(c + 1));
+    let is_closed_worked = |c: usize| {
+        let (col_start, col_end) = col_range(c);
+        entries.iter().any(|e| {
+            e.end
+                .is_some_and(|end| e.start < col_end && col_start < end)
+        })
     };
 
     let open = entries.iter().find(|e| e.end.is_none());
     let open_end = open.map(|_| if day == today { now } else { window_end });
-    let is_open_worked = |t: NaiveTime| {
+    let is_open_worked = |c: usize| {
+        let (col_start, col_end) = col_range(c);
         open.zip(open_end)
-            .is_some_and(|(o, oe)| o.start <= t && t < oe)
+            .is_some_and(|(o, oe)| o.start < col_end && col_start < oe)
     };
 
     let mut cells: Vec<Cell> = (0..width)
         .map(|c| {
-            let t = col_time(c);
-            if is_closed_worked(t) || is_open_worked(t) {
+            if is_closed_worked(c) || is_open_worked(c) {
                 Cell::Worked
             } else {
                 Cell::Empty
@@ -942,11 +950,11 @@ fn day_bar(
     // by the identical predicate, rather than re-deriving a column from a
     // time offset (that inverse isn't exact under integer truncation and
     // could land one column short, leaving a stray solid cell past the fade).
-    if let Some(boundary) = (0..width).rev().find(|&c| is_open_worked(col_time(c))) {
+    if let Some(boundary) = (0..width).rev().find(|&c| is_open_worked(c)) {
         for stage in 0..FADE.len() {
             let back = FADE.len() - 1 - stage;
             if let Some(c) = boundary.checked_sub(back)
-                && !is_closed_worked(col_time(c))
+                && !is_closed_worked(c)
             {
                 cells[c] = Cell::Open(stage);
             }
