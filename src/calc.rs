@@ -89,19 +89,22 @@ pub fn minutes_left_week(
     (weekly_goal_minutes(cfg) - worked).max(0)
 }
 
-/// Net shortfall from every day that has already fully elapsed before
-/// `today`, going all the way back to the earliest logged entry (not just
-/// the current week) - each day expected to hit its own daily target, with
-/// a day worked past target offsetting shortfall from another day, in any
-/// week, net. Unlike `minutes_left_week`, this does not reset at the start
-/// of a new week: unpaid shortfall from a prior week carries forward until
-/// later surplus days pay it off. Reduced live by any surplus already
-/// worked today - so it can clear before the day is over, as soon as
+/// Signed version of the time debt: positive means behind (that many
+/// minutes owing), negative means ahead (that many minutes of surplus left
+/// over after every historical shortfall is paid off). Net shortfall from
+/// every day that has already fully elapsed before `today`, going all the
+/// way back to the earliest logged entry (not just the current week) - each
+/// day expected to hit its own daily target, with a day worked past target
+/// offsetting shortfall from another day, in any week, net. Unlike
+/// `minutes_left_week`, this does not reset at the start of a new week:
+/// unpaid shortfall from a prior week carries forward until later surplus
+/// days pay it off. Reduced live by any surplus already worked today - so
+/// it can clear (and go negative) before the day is over, as soon as
 /// today's extra hours are enough to pay it off. Not yet having worked
 /// today's own target isn't held against you here (that's what
 /// `minutes_left_today` / `leave_time` already show); only hours worked
-/// *past* it count. Clamped to 0 (never negative).
-pub fn time_debt_minutes(
+/// *past* it count.
+fn time_balance_minutes(
     entries: &[TimeEntry],
     cfg: &Config,
     today: NaiveDate,
@@ -117,7 +120,33 @@ pub fn time_debt_minutes(
     }
     let worked_today = worked_minutes(&entries_on(entries, today), today, now);
     let surplus_today = (worked_today - daily_target_minutes(cfg, today)).max(0);
-    (historical - surplus_today).max(0)
+    historical - surplus_today
+}
+
+/// Minutes currently owed toward the time debt - see `time_balance_minutes`.
+/// Clamped to 0 (never negative); use `time_surplus_minutes` to see how far
+/// ahead you are once the debt is fully paid off.
+pub fn time_debt_minutes(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> i64 {
+    time_balance_minutes(entries, cfg, today, now).max(0)
+}
+
+/// Minutes worked beyond what's needed to clear all outstanding time debt -
+/// 0 whenever there's still debt owing (or the balance is exactly even).
+/// This is what surfaces "negative debt": once today's surplus fully pays
+/// off every prior shortfall, further surplus shows up here instead of
+/// silently vanishing into the debt's floor at 0.
+pub fn time_surplus_minutes(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> i64 {
+    (-time_balance_minutes(entries, cfg, today, now)).max(0)
 }
 
 /// Gaps between consecutive logged entries for `day`, sorted by start time.
@@ -369,6 +398,36 @@ mod tests {
         ];
         let wednesday = date(2026, 9, 9);
         assert_eq!(time_debt_minutes(&entries, &c, wednesday, end_of_day()), 0);
+    }
+
+    #[test]
+    fn time_surplus_minutes_shows_net_ahead_amount() {
+        let c = cfg(40.0, 30);
+        // Same fixture as time_debt_clamps_to_zero_when_net_ahead: net
+        // ahead by 3h40m - 1h20m = 2h20m (140min), which the debt figure
+        // itself just floors to 0 - this is where that surplus shows up.
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "19:40"), // Mon 11h40m, surplus 3h40m
+            entry(2, date(2026, 9, 8), "08:00", "14:40"), // Tue 6h40m, deficit 1h20m
+        ];
+        let wednesday = date(2026, 9, 9);
+        assert_eq!(
+            time_surplus_minutes(&entries, &c, wednesday, end_of_day()),
+            140
+        );
+    }
+
+    #[test]
+    fn time_surplus_minutes_zero_while_debt_still_owed() {
+        let c = cfg(40.0, 30);
+        let entries = vec![entry(1, date(2026, 9, 7), "08:00", "13:00")]; // Mon 5h, deficit 3h
+        let wednesday = date(2026, 9, 9);
+        let debt = time_debt_minutes(&entries, &c, wednesday, end_of_day());
+        assert!(debt > 0, "test needs outstanding debt to be meaningful");
+        assert_eq!(
+            time_surplus_minutes(&entries, &c, wednesday, end_of_day()),
+            0
+        );
     }
 
     #[test]

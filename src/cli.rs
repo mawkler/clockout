@@ -298,6 +298,11 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
             calc::format_hm(debt),
             clear_debt_by.format("%H:%M")
         );
+    } else {
+        let surplus = calc::time_surplus_minutes(&data.entries, &cfg, today, now);
+        if surplus > 0 {
+            println!("Time debt: +{}", calc::format_hm(surplus));
+        }
     }
     if let Some(open) = calc::open_entry(&data.entries) {
         println!(
