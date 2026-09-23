@@ -301,7 +301,7 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     } else {
         let surplus = calc::time_surplus_minutes(&data.entries, &cfg, today, now);
         if surplus > 0 {
-            println!("Time debt: +{}", calc::format_hm(surplus));
+            println!("Time debt: -{}", calc::format_hm(surplus));
         }
     }
     if let Some(open) = calc::open_entry(&data.entries) {

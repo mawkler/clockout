@@ -694,7 +694,7 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64, surplus: i64) {
         lines.push(Line::from(vec![
             Span::styled("Time debt: ", label),
             Span::styled(
-                format!("+{}", calc::format_hm(surplus)),
+                format!("-{}", calc::format_hm(surplus)),
                 Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
             ),
         ]));
