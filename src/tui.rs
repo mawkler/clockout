@@ -206,6 +206,9 @@ impl App {
 
     fn open_edit(&mut self) {
         if let Some(e) = self.selected_entry() {
+            // An in-progress entry already has its start filled in - jump
+            // straight to the blank end field instead of the start field.
+            let focus = if e.end.is_none() { 2 } else { 1 };
             self.mode = Mode::Modal(ModalState {
                 kind: ModalKind::AddEdit,
                 editing_id: Some(e.id),
@@ -216,7 +219,7 @@ impl App {
                     .map(|t| t.format("%H:%M").to_string())
                     .unwrap_or_default(),
                 time_buf: String::new(),
-                focus: 1,
+                focus,
                 field_selected: true,
                 error: None,
             });
