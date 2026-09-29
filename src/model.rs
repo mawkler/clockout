@@ -43,6 +43,11 @@ pub struct Config {
     pub weekly_goal_hours: f64,
     #[serde(default = "default_estimated_lunch_break")]
     pub estimated_lunch_break_minutes: u32,
+    /// If true, Saturday and Sunday are left out of the week diagram, day
+    /// navigation, and the history view entirely - not just zeroed targets
+    /// (which they already have regardless of this flag).
+    #[serde(default)]
+    pub hide_weekends: bool,
 }
 
 impl Default for Config {
@@ -50,6 +55,7 @@ impl Default for Config {
         Config {
             weekly_goal_hours: 40.0,
             estimated_lunch_break_minutes: default_estimated_lunch_break(),
+            hide_weekends: false,
         }
     }
 }

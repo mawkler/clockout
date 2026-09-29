@@ -2,7 +2,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use chrono::{Local, NaiveDate, NaiveTime};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime, Weekday};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -83,6 +83,13 @@ enum Pane {
     Entries,
 }
 
+/// Which top-level view is showing. Toggled with 'h'.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Screen {
+    Dashboard,
+    History,
+}
+
 struct App {
     entries: Vec<TimeEntry>,
     config: Config,
@@ -95,6 +102,10 @@ struct App {
     /// Index into the focused day's entries, for e/d and highlighting.
     selected: usize,
     mode: Mode,
+    screen: Screen,
+    /// How many rows of the history view are scrolled past, oldest-first;
+    /// clamped in `draw_history` once the row count is known.
+    history_scroll: usize,
     /// A transient footer message and when it was set, for `STATUS_DURATION`
     /// auto-dismissal - see `set_status`/`clear_expired_status`.
     status: Option<(StatusKind, String, Instant)>,
@@ -105,16 +116,20 @@ impl App {
     fn new() -> Result<Self> {
         let entries = storage::load_entries()?.entries;
         let config = storage::load_config()?;
-        Ok(App {
+        let mut app = App {
             entries,
             config,
             focused_day: Local::now().date_naive(),
             focus_pane: Pane::Entries,
             selected: 0,
             mode: Mode::Normal,
+            screen: Screen::Dashboard,
+            history_scroll: 0,
             status: None,
             quit: false,
-        })
+        };
+        app.snap_focused_day();
+        Ok(app)
     }
 
     fn set_status(&mut self, kind: StatusKind, message: impl Into<String>) {
@@ -140,7 +155,37 @@ impl App {
         } else if self.selected >= len {
             self.selected = len - 1;
         }
+        self.snap_focused_day();
         Ok(())
+    }
+
+    /// True if `day` should be left out of the week diagram, day navigation,
+    /// and the history view because `hide_weekends` is on and it's a
+    /// Saturday or Sunday.
+    fn hides(&self, day: NaiveDate) -> bool {
+        self.config.hide_weekends && matches!(day.weekday(), Weekday::Sat | Weekday::Sun)
+    }
+
+    /// Same as `hides`, but for a Mon=0..Sun=6 column index (the history
+    /// view's day columns) rather than an actual date.
+    fn hides_index(&self, i: usize) -> bool {
+        self.config.hide_weekends && i >= 5
+    }
+
+    /// If `focused_day` is currently a hidden day (e.g. `hide_weekends` was
+    /// just turned on, or the app started on a hidden weekend day), move it
+    /// to the nearest visible day in the current week instead.
+    fn snap_focused_day(&mut self) {
+        if !self.hides(self.focused_day) {
+            return;
+        }
+        if let Some(&nearest) = self
+            .week_days()
+            .iter()
+            .min_by_key(|&&d| (d - self.focused_day).num_days().abs())
+        {
+            self.focused_day = nearest;
+        }
     }
 
     fn today(&self) -> NaiveDate {
@@ -154,11 +199,13 @@ impl App {
         v
     }
 
-    /// The 7 days (Monday-Sunday) of the current week, for the diagram.
+    /// The days of the current week (Monday-Sunday, or Monday-Friday if
+    /// `hide_weekends` is on) shown in the diagram and navigable with j/k.
     fn week_days(&self) -> Vec<NaiveDate> {
         let (week_start, _) = calc::week_bounds(self.today());
         (0..7)
             .map(|i| week_start + chrono::Duration::days(i))
+            .filter(|&d| !self.hides(d))
             .collect()
     }
 
@@ -176,14 +223,18 @@ impl App {
         self.selected = cur.clamp(0, len as i32 - 1) as usize;
     }
 
-    /// Moves the focused day within the current week (clamped to
-    /// Monday..Sunday) and resets entry selection, since the entry list
-    /// underneath just changed. Called from j/k while the Days pane has
-    /// focus.
+    /// Moves the focused day within the current week's visible days
+    /// (see `week_days`, clamped to its first/last) and resets entry
+    /// selection, since the entry list underneath just changed. Called
+    /// from j/k while the Days pane has focus.
     fn move_focused_day(&mut self, delta: i64) {
-        let (week_start, week_end) = calc::week_bounds(self.today());
-        let moved = self.focused_day + chrono::Duration::days(delta);
-        self.focused_day = moved.clamp(week_start, week_end);
+        let days = self.week_days();
+        let idx = days
+            .iter()
+            .position(|&d| d == self.focused_day)
+            .unwrap_or(0);
+        let new_idx = (idx as i64 + delta).clamp(0, days.len() as i64 - 1) as usize;
+        self.focused_day = days[new_idx];
         self.selected = 0;
     }
 
@@ -453,6 +504,23 @@ impl App {
         self.set_status(StatusKind::Info, format!("deleted #{id}"));
         Ok(())
     }
+
+    /// Scrolls the history view by `delta` rows (positive = later/down),
+    /// clamped to the number of weeks there are to show. `draw_history`
+    /// clamps further so the window never scrolls past a full screen, but
+    /// that tighter bound isn't written back here - this one is
+    /// deliberately loose, just enough to stop indefinite drift.
+    fn scroll_history(&mut self, delta: i64) {
+        let total = calc::history_weeks(
+            &self.entries,
+            &self.config,
+            self.today(),
+            Local::now().time(),
+        )
+        .len();
+        let max = total.saturating_sub(1) as i64;
+        self.history_scroll = (self.history_scroll as i64 + delta).clamp(0, max) as usize;
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -493,28 +561,39 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
 fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
     match &mut app.mode {
-        Mode::Normal => match code {
-            KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
-            KeyCode::Char('a') => app.open_add(),
-            KeyCode::Char('f') => app.open_finish(),
-            KeyCode::Char('e') if app.focus_pane == Pane::Entries => app.open_edit(),
-            KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
-            KeyCode::Char('r') => app.reload()?,
-            KeyCode::Tab => {
-                app.focus_pane = match app.focus_pane {
-                    Pane::Days => Pane::Entries,
-                    Pane::Entries => Pane::Days,
-                };
-            }
-            KeyCode::Char('j') | KeyCode::Down => match app.focus_pane {
-                Pane::Days => app.move_focused_day(1),
-                Pane::Entries => app.move_selection(1),
+        Mode::Normal => match app.screen {
+            Screen::Dashboard => match code {
+                KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
+                KeyCode::Char('a') => app.open_add(),
+                KeyCode::Char('f') => app.open_finish(),
+                KeyCode::Char('e') if app.focus_pane == Pane::Entries => app.open_edit(),
+                KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
+                KeyCode::Char('r') => app.reload()?,
+                KeyCode::Char('h') => app.screen = Screen::History,
+                KeyCode::Tab => {
+                    app.focus_pane = match app.focus_pane {
+                        Pane::Days => Pane::Entries,
+                        Pane::Entries => Pane::Days,
+                    };
+                }
+                KeyCode::Char('j') | KeyCode::Down => match app.focus_pane {
+                    Pane::Days => app.move_focused_day(1),
+                    Pane::Entries => app.move_selection(1),
+                },
+                KeyCode::Char('k') | KeyCode::Up => match app.focus_pane {
+                    Pane::Days => app.move_focused_day(-1),
+                    Pane::Entries => app.move_selection(-1),
+                },
+                _ => {}
             },
-            KeyCode::Char('k') | KeyCode::Up => match app.focus_pane {
-                Pane::Days => app.move_focused_day(-1),
-                Pane::Entries => app.move_selection(-1),
+            Screen::History => match code {
+                KeyCode::Char('q') => app.quit = true,
+                KeyCode::Char('h') | KeyCode::Esc => app.screen = Screen::Dashboard,
+                KeyCode::Char('r') => app.reload()?,
+                KeyCode::Char('j') | KeyCode::Down => app.scroll_history(1),
+                KeyCode::Char('k') | KeyCode::Up => app.scroll_history(-1),
+                _ => {}
             },
-            _ => {}
         },
         Mode::ConfirmDelete(id) => {
             let id = *id;
@@ -576,6 +655,19 @@ fn current_buf(m: &mut ModalState) -> &mut String {
 }
 
 fn draw(f: &mut Frame, app: &App) {
+    match app.screen {
+        Screen::Dashboard => draw_dashboard(f, app),
+        Screen::History => draw_history_screen(f, app),
+    }
+
+    match &app.mode {
+        Mode::Modal(m) => draw_modal(f, m),
+        Mode::ConfirmDelete(id) => draw_confirm(f, *id),
+        Mode::Normal => {}
+    }
+}
+
+fn draw_dashboard(f: &mut Frame, app: &App) {
     let now = Local::now().time();
     let debt = calc::time_debt_minutes(&app.entries, &app.config, app.today(), now);
     let surplus = calc::time_surplus_minutes(&app.entries, &app.config, app.today(), now);
@@ -596,12 +688,6 @@ fn draw(f: &mut Frame, app: &App) {
     draw_week_diagram(f, app, chunks[2]);
     draw_day_entries(f, app, chunks[3]);
     draw_footer(f, app, chunks[4]);
-
-    match &app.mode {
-        Mode::Modal(m) => draw_modal(f, m),
-        Mode::ConfirmDelete(id) => draw_confirm(f, *id),
-        Mode::Normal => {}
-    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -1016,6 +1102,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("d", "delete"),
             ("Tab", "switch pane"),
             ("j/k", "move"),
+            ("h", "history"),
             ("r", "reload"),
         ])),
     };
@@ -1204,5 +1291,130 @@ fn draw_confirm(f: &mut Frame, id: u64) {
         Span::styled("(y/n)", Style::default().fg(MUTED)),
     ]))
     .block(block);
+    f.render_widget(p, area);
+}
+
+const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+fn draw_history_screen(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(f.area());
+
+    draw_history(f, app, chunks[0]);
+    draw_history_footer(f, chunks[1]);
+}
+
+/// One row per week, newest first: a week-start label, each visible day's
+/// worked total (colored - see `history_cell_color`), and the week's total
+/// against the goal. Scrolls with j/k (`app.history_scroll`) once there are
+/// more weeks than fit; the header row itself never scrolls.
+fn draw_history(f: &mut Frame, app: &App, area: Rect) {
+    let today = app.today();
+    let now = Local::now().time();
+    let mut rows = calc::history_weeks(&app.entries, &app.config, today, now);
+    rows.reverse(); // newest first
+
+    let day_indices: Vec<usize> = (0..7).filter(|&i| !app.hides_index(i)).collect();
+
+    let label_width = 8usize;
+    let day_width = 7usize;
+    let total_width = 12usize;
+
+    let mut header_spans = vec![Span::styled(
+        " ".repeat(label_width),
+        Style::default().fg(LABEL),
+    )];
+    for &i in &day_indices {
+        header_spans.push(Span::styled(
+            format!("{:>day_width$}", DAY_LABELS[i]),
+            Style::default().fg(LABEL),
+        ));
+    }
+    header_spans.push(Span::styled(
+        format!("{:>total_width$}", "Total"),
+        Style::default().fg(LABEL),
+    ));
+    let mut lines = vec![Line::from(header_spans)];
+
+    // Inner height available for data rows: block borders (2) + header (1).
+    let visible_rows = (area.height as usize).saturating_sub(3).max(1);
+    let max_start = rows.len().saturating_sub(visible_rows);
+    let start = app.history_scroll.min(max_start);
+    let end = (start + visible_rows).min(rows.len());
+
+    for row in &rows[start..end] {
+        let mut spans = vec![Span::styled(
+            format!(
+                "{:<label_width$}",
+                row.week_start.format("%b %d").to_string()
+            ),
+            Style::default().fg(LABEL),
+        )];
+        for &i in &day_indices {
+            let (day, worked) = row.day_totals[i];
+            let target = calc::daily_target_minutes(&app.config, day);
+            let color = history_cell_color(day, today, worked, target);
+            let text = if day > today {
+                "-".to_string()
+            } else {
+                calc::format_hm(worked)
+            };
+            spans.push(Span::styled(
+                format!("{text:>day_width$}"),
+                Style::default().fg(color),
+            ));
+        }
+        let total_color = if row.worked_week >= row.goal_week {
+            SUCCESS
+        } else {
+            ACCENT
+        };
+        spans.push(Span::styled(
+            format!(
+                "{:>total_width$}",
+                format!(
+                    "{}/{}",
+                    calc::format_hm(row.worked_week),
+                    calc::format_hm(row.goal_week)
+                )
+            ),
+            Style::default()
+                .fg(total_color)
+                .add_modifier(Modifier::BOLD),
+        ));
+        lines.push(Line::from(spans));
+    }
+
+    let p = Paragraph::new(lines).block(gray_block(" History "));
+    f.render_widget(p, area);
+}
+
+/// Color for one history cell: muted for a day that hasn't happened yet or
+/// has no target and nothing logged, green once that day's target is met,
+/// cyan for today (still in progress) or any other logged time, red for a
+/// weekday that's already over with nothing logged at all.
+fn history_cell_color(day: NaiveDate, today: NaiveDate, worked: i64, target: i64) -> Color {
+    if day > today {
+        MUTED
+    } else if target > 0 && worked >= target {
+        SUCCESS
+    } else if day == today || worked > 0 {
+        ACCENT
+    } else if target == 0 {
+        MUTED
+    } else {
+        DANGER
+    }
+}
+
+fn draw_history_footer(f: &mut Frame, area: Rect) {
+    let p = Paragraph::new(hint_line(&[
+        ("q", "quit"),
+        ("j/k", "scroll"),
+        ("h/Esc", "back"),
+        ("r", "reload"),
+    ]));
     f.render_widget(p, area);
 }

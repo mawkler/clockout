@@ -50,6 +50,8 @@ pub enum Command {
         #[arg(long)]
         all: bool,
     },
+    /// Show weekly totals, one week per row and one day per column
+    History,
     /// Edit an existing entry by id
     Edit {
         id: u64,
@@ -85,6 +87,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         Command::Status => cmd_status(today),
         Command::Tui => crate::tui::run(),
         Command::List { all } => cmd_list(all, today),
+        Command::History => cmd_history(today),
         Command::Edit { id, range, date } => cmd_edit(id, range, date),
         Command::Delete { id } => cmd_delete(id),
     }
@@ -334,6 +337,45 @@ fn cmd_list(all: bool, today: NaiveDate) -> anyhow::Result<()> {
             e.date,
             e.start.format("%H:%M"),
             calc::format_end(e.end)
+        );
+    }
+    Ok(())
+}
+
+const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+fn cmd_history(today: NaiveDate) -> anyhow::Result<()> {
+    let cfg = storage::load_config()?;
+    let data = storage::load_entries()?;
+    let now = Local::now().time();
+
+    let day_indices: Vec<usize> = (0..7).filter(|&i| !(cfg.hide_weekends && i >= 5)).collect();
+
+    print!("{:<8}", "");
+    for &i in &day_indices {
+        print!("{:>7}", DAY_LABELS[i]);
+    }
+    println!("{:>12}", "Total");
+
+    let rows = calc::history_weeks(&data.entries, &cfg, today, now);
+    for row in rows.iter().rev() {
+        print!("{:<8}", row.week_start.format("%b %d").to_string());
+        for &i in &day_indices {
+            let (day, worked) = row.day_totals[i];
+            let cell = if day > today {
+                "-".to_string()
+            } else {
+                calc::format_hm(worked)
+            };
+            print!("{cell:>7}");
+        }
+        println!(
+            "{:>12}",
+            format!(
+                "{}/{}",
+                calc::format_hm(row.worked_week),
+                calc::format_hm(row.goal_week)
+            )
         );
     }
     Ok(())

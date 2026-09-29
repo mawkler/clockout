@@ -68,6 +68,54 @@ pub fn worked_minutes(entries: &[&TimeEntry], today: NaiveDate, now: NaiveTime) 
     entries.iter().map(|e| entry_minutes(e, today, now)).sum()
 }
 
+/// One row of the history view: a week's Monday, its Mon-Sun daily totals
+/// (minutes worked that day, live-capped same as everywhere else), and the
+/// week's total against the weekly goal.
+pub struct WeekRow {
+    pub week_start: NaiveDate,
+    pub day_totals: Vec<(NaiveDate, i64)>,
+    pub worked_week: i64,
+    pub goal_week: i64,
+}
+
+/// One row per week from the earliest logged entry's week through the
+/// current week, oldest first. Which days to actually display (e.g.
+/// dropping weekends) is a rendering concern left to the caller - this
+/// always computes all 7 days, so nothing here needs to know about
+/// `Config::hide_weekends`.
+pub fn history_weeks(
+    entries: &[TimeEntry],
+    cfg: &Config,
+    today: NaiveDate,
+    now: NaiveTime,
+) -> Vec<WeekRow> {
+    let earliest = entries.iter().map(|e| e.date).min().unwrap_or(today);
+    let (first_week_start, _) = week_bounds(earliest);
+    let (current_week_start, _) = week_bounds(today);
+    let goal_week = weekly_goal_minutes(cfg);
+
+    let mut rows = Vec::new();
+    let mut week_start = first_week_start;
+    while week_start <= current_week_start {
+        let day_totals: Vec<(NaiveDate, i64)> = (0..7)
+            .map(|i| {
+                let day = week_start + Duration::days(i);
+                let worked = worked_minutes(&entries_on(entries, day), today, now);
+                (day, worked)
+            })
+            .collect();
+        let worked_week = day_totals.iter().map(|(_, m)| m).sum();
+        rows.push(WeekRow {
+            week_start,
+            day_totals,
+            worked_week,
+            goal_week,
+        });
+        week_start += Duration::weeks(1);
+    }
+    rows
+}
+
 pub fn minutes_left_today(
     entries: &[TimeEntry],
     cfg: &Config,
@@ -281,6 +329,7 @@ mod tests {
         Config {
             weekly_goal_hours: goal,
             estimated_lunch_break_minutes: lunch_break,
+            hide_weekends: false,
         }
     }
 
@@ -349,6 +398,37 @@ mod tests {
         assert_eq!(week_bounds(monday), (monday, sunday));
         assert_eq!(week_bounds(sunday), (monday, sunday));
         assert_eq!(week_bounds(midweek), (monday, sunday));
+    }
+
+    #[test]
+    fn history_weeks_empty_with_no_entries_is_just_the_current_week() {
+        let c = cfg(40.0, 30);
+        let today = date(2026, 9, 11); // Friday
+        let rows = history_weeks(&[], &c, today, end_of_day());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].week_start, date(2026, 9, 7));
+        assert_eq!(rows[0].worked_week, 0);
+        assert_eq!(rows[0].day_totals.len(), 7);
+        assert_eq!(rows[0].day_totals[0], (date(2026, 9, 7), 0));
+    }
+
+    #[test]
+    fn history_weeks_spans_from_earliest_entry_to_current_week() {
+        let c = cfg(40.0, 30);
+        let entries = vec![
+            entry(1, date(2026, 8, 31), "08:00", "16:00"), // Mon, 3 weeks back
+            entry(2, date(2026, 9, 9), "08:00", "12:00"),  // Wed, 1 week back
+        ];
+        let today = date(2026, 9, 11); // Friday, current week starts 9/7
+        let rows = history_weeks(&entries, &c, today, end_of_day());
+        assert_eq!(
+            rows.iter().map(|r| r.week_start).collect::<Vec<_>>(),
+            vec![date(2026, 8, 31), date(2026, 9, 7),]
+        );
+        assert_eq!(rows[0].worked_week, 8 * 60);
+        assert_eq!(rows[1].worked_week, 4 * 60);
+        // Wednesday's total lands in the right day slot of the right row.
+        assert_eq!(rows[1].day_totals[2], (date(2026, 9, 9), 4 * 60));
     }
 
     #[test]
