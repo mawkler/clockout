@@ -1,4 +1,4 @@
-use chrono::{Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate};
 use clap::{Parser, Subcommand};
 
 use crate::calc;
@@ -357,9 +357,18 @@ fn cmd_history(today: NaiveDate) -> anyhow::Result<()> {
     }
     println!("{:>12}", "Total");
 
+    let (current_week_start, _) = calc::week_bounds(today);
     let rows = calc::history_weeks(&data.entries, &cfg, today, now);
     for row in rows.iter().rev() {
-        print!("{:<8}", row.week_start.format("%b %d").to_string());
+        let marker = if row.week_start == current_week_start {
+            "*"
+        } else {
+            " "
+        };
+        print!(
+            "{:<8}",
+            format!("W{:02}{marker}", row.week_start.iso_week().week())
+        );
         for &i in &day_indices {
             let (day, worked) = row.day_totals[i];
             let cell = if day > today {

@@ -1344,14 +1344,21 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
     let start = app.history_scroll.min(max_start);
     let end = (start + visible_rows).min(rows.len());
 
+    let (current_week_start, _) = calc::week_bounds(today);
     for row in &rows[start..end] {
-        let mut spans = vec![Span::styled(
-            format!(
-                "{:<label_width$}",
-                row.week_start.format("%b %d").to_string()
-            ),
-            Style::default().fg(LABEL),
-        )];
+        let label = format!(
+            "{:<label_width$}",
+            format!("W{:02}", row.week_start.iso_week().week())
+        );
+        let label_style = if row.week_start == current_week_start {
+            Style::default()
+                .fg(Color::Black)
+                .bg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(LABEL)
+        };
+        let mut spans = vec![Span::styled(label, label_style)];
         for &i in &day_indices {
             let (day, worked) = row.day_totals[i];
             let target = calc::daily_target_minutes(&app.config, day);
