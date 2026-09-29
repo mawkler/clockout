@@ -103,9 +103,9 @@ struct App {
     selected: usize,
     mode: Mode,
     screen: Screen,
-    /// How many rows of the history view are scrolled past, oldest-first;
-    /// clamped in `draw_history` once the row count is known.
-    history_scroll: usize,
+    /// Index (newest-first) of the selected row in the history view, for
+    /// j/k and the week-diagram preview below it.
+    history_selected: usize,
     /// A transient footer message and when it was set, for `STATUS_DURATION`
     /// auto-dismissal - see `set_status`/`clear_expired_status`.
     status: Option<(StatusKind, String, Instant)>,
@@ -124,7 +124,7 @@ impl App {
             selected: 0,
             mode: Mode::Normal,
             screen: Screen::Dashboard,
-            history_scroll: 0,
+            history_selected: 0,
             status: None,
             quit: false,
         };
@@ -156,6 +156,7 @@ impl App {
             self.selected = len - 1;
         }
         self.snap_focused_day();
+        self.clamp_history_selection();
         Ok(())
     }
 
@@ -199,14 +200,20 @@ impl App {
         v
     }
 
-    /// The days of the current week (Monday-Sunday, or Monday-Friday if
-    /// `hide_weekends` is on) shown in the diagram and navigable with j/k.
-    fn week_days(&self) -> Vec<NaiveDate> {
-        let (week_start, _) = calc::week_bounds(self.today());
+    /// The days of `week_start`'s week (Monday-Sunday, or Monday-Friday if
+    /// `hide_weekends` is on).
+    fn days_in_week(&self, week_start: NaiveDate) -> Vec<NaiveDate> {
         (0..7)
             .map(|i| week_start + chrono::Duration::days(i))
             .filter(|&d| !self.hides(d))
             .collect()
+    }
+
+    /// The days of the current week, shown in the diagram and navigable
+    /// with j/k.
+    fn week_days(&self) -> Vec<NaiveDate> {
+        let (week_start, _) = calc::week_bounds(self.today());
+        self.days_in_week(week_start)
     }
 
     fn selected_entry(&self) -> Option<TimeEntry> {
@@ -505,21 +512,28 @@ impl App {
         Ok(())
     }
 
-    /// Scrolls the history view by `delta` rows (positive = later/down),
-    /// clamped to the number of weeks there are to show. `draw_history`
-    /// clamps further so the window never scrolls past a full screen, but
-    /// that tighter bound isn't written back here - this one is
-    /// deliberately loose, just enough to stop indefinite drift.
-    fn scroll_history(&mut self, delta: i64) {
-        let total = calc::history_weeks(
+    /// Number of rows the history view currently has to show.
+    fn history_row_count(&self) -> usize {
+        calc::history_weeks(
             &self.entries,
             &self.config,
             self.today(),
             Local::now().time(),
         )
-        .len();
-        let max = total.saturating_sub(1) as i64;
-        self.history_scroll = (self.history_scroll as i64 + delta).clamp(0, max) as usize;
+        .len()
+    }
+
+    fn clamp_history_selection(&mut self) {
+        let max = self.history_row_count().saturating_sub(1);
+        self.history_selected = self.history_selected.min(max);
+    }
+
+    /// Moves the history view's row selection by `delta` (positive =
+    /// later/down), clamped to the weeks there are to show. `draw_history`
+    /// scrolls the list to keep the selection visible.
+    fn move_history_selection(&mut self, delta: i64) {
+        let max = self.history_row_count().saturating_sub(1) as i64;
+        self.history_selected = (self.history_selected as i64 + delta).clamp(0, max) as usize;
     }
 }
 
@@ -590,8 +604,8 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 KeyCode::Char('q') => app.quit = true,
                 KeyCode::Char('h') | KeyCode::Esc => app.screen = Screen::Dashboard,
                 KeyCode::Char('r') => app.reload()?,
-                KeyCode::Char('j') | KeyCode::Down => app.scroll_history(1),
-                KeyCode::Char('k') | KeyCode::Up => app.scroll_history(-1),
+                KeyCode::Char('j') | KeyCode::Down => app.move_history_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => app.move_history_selection(-1),
                 _ => {}
             },
         },
@@ -797,7 +811,8 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64, surplus: i64) {
 fn draw_week_diagram(f: &mut Frame, app: &App, area: Rect) {
     // Matches Block::inner() for a plain Borders::ALL block: 1 column each side.
     let inner_width = area.width.saturating_sub(2);
-    let lines = week_lines(app, inner_width);
+    let (week_start, _) = calc::week_bounds(app.today());
+    let lines = week_lines(app, week_start, inner_width);
     let p = Paragraph::new(lines).block(gray_block(" This week "));
     f.render_widget(p, area);
 }
@@ -892,16 +907,17 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// One line per day of the current week: weekday name, total hours, and a
-/// bar showing where in the day the logged time falls (all rows share the
-/// same time-of-day scale so they're visually comparable).
-fn week_lines(app: &App, inner_width: u16) -> Vec<Line<'static>> {
+/// One line per day of `week_start`'s week: weekday name, total hours, and
+/// a bar showing where in the day the logged time falls (all rows share
+/// the same time-of-day scale so they're visually comparable). Used both
+/// for the dashboard's always-current-week diagram and the history view's
+/// preview of whichever week is selected there.
+fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'static>> {
     let today = app.today();
     let now = Local::now().time();
-    let (week_start, _) = calc::week_bounds(today);
     let (window_start, window_end) = day_window(&app.entries, week_start, now);
 
-    app.week_days()
+    app.days_in_week(week_start)
         .into_iter()
         .map(|day| {
             let day_entries = calc::entries_on(&app.entries, day);
@@ -1297,25 +1313,32 @@ fn draw_confirm(f: &mut Frame, id: u64) {
 const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 
 fn draw_history_screen(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1)])
-        .split(f.area());
-
-    draw_history(f, app, chunks[0]);
-    draw_history_footer(f, chunks[1]);
-}
-
-/// One row per week, newest first: a week-start label, each visible day's
-/// worked total (colored - see `history_cell_color`), and the week's total
-/// against the goal. Scrolls with j/k (`app.history_scroll`) once there are
-/// more weeks than fit; the header row itself never scrolls.
-fn draw_history(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let now = Local::now().time();
     let mut rows = calc::history_weeks(&app.entries, &app.config, today, now);
     rows.reverse(); // newest first
 
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(9),
+            Constraint::Length(1),
+        ])
+        .split(f.area());
+
+    draw_history(f, app, chunks[0], &rows);
+    draw_history_preview(f, app, chunks[1], &rows);
+    draw_history_footer(f, chunks[2]);
+}
+
+/// One selectable row per week, newest first: a week-number label, each
+/// visible day's worked total (colored - see `history_cell_color`), and
+/// the week's total against the goal. The header row itself is fixed above
+/// the list and never scrolls; j/k moves `app.history_selected`, which also
+/// drives `draw_history_preview` below.
+fn draw_history(f: &mut Frame, app: &App, area: Rect, rows: &[calc::WeekRow]) {
+    let today = app.today();
     let day_indices: Vec<usize> = (0..7).filter(|&i| !app.hides_index(i)).collect();
 
     let label_width = 8usize;
@@ -1336,65 +1359,93 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect) {
         format!("{:>total_width$}", "Total"),
         Style::default().fg(LABEL),
     ));
-    let mut lines = vec![Line::from(header_spans)];
 
-    // Inner height available for data rows: block borders (2) + header (1).
-    let visible_rows = (area.height as usize).saturating_sub(3).max(1);
-    let max_start = rows.len().saturating_sub(visible_rows);
-    let start = app.history_scroll.min(max_start);
-    let end = (start + visible_rows).min(rows.len());
+    let block = gray_block(" History ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    f.render_widget(Paragraph::new(Line::from(header_spans)), inner_chunks[0]);
 
     let (current_week_start, _) = calc::week_bounds(today);
-    for row in &rows[start..end] {
-        let label = format!(
-            "{:<label_width$}",
-            format!("W{:02}", row.week_start.iso_week().week())
-        );
-        let label_style = if row.week_start == current_week_start {
-            Style::default()
-                .fg(Color::Black)
-                .bg(ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(LABEL)
-        };
-        let mut spans = vec![Span::styled(label, label_style)];
-        for &i in &day_indices {
-            let (day, worked) = row.day_totals[i];
-            let target = calc::daily_target_minutes(&app.config, day);
-            let color = history_cell_color(day, today, worked, target);
-            let text = if day > today {
-                "-".to_string()
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|row| {
+            let label = format!(
+                "{:<label_width$}",
+                format!("W{:02}", row.week_start.iso_week().week())
+            );
+            let label_style = if row.week_start == current_week_start {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                calc::format_hm(worked)
+                Style::default().fg(LABEL)
+            };
+            let mut spans = vec![Span::styled(label, label_style)];
+            for &i in &day_indices {
+                let (day, worked) = row.day_totals[i];
+                let target = calc::daily_target_minutes(&app.config, day);
+                let color = history_cell_color(day, today, worked, target);
+                let text = if day > today {
+                    "-".to_string()
+                } else {
+                    calc::format_hm(worked)
+                };
+                spans.push(Span::styled(
+                    format!("{text:>day_width$}"),
+                    Style::default().fg(color),
+                ));
+            }
+            let total_color = if row.worked_week >= row.goal_week {
+                SUCCESS
+            } else {
+                ACCENT
             };
             spans.push(Span::styled(
-                format!("{text:>day_width$}"),
-                Style::default().fg(color),
-            ));
-        }
-        let total_color = if row.worked_week >= row.goal_week {
-            SUCCESS
-        } else {
-            ACCENT
-        };
-        spans.push(Span::styled(
-            format!(
-                "{:>total_width$}",
                 format!(
-                    "{}/{}",
-                    calc::format_hm(row.worked_week),
-                    calc::format_hm(row.goal_week)
-                )
-            ),
-            Style::default()
-                .fg(total_color)
-                .add_modifier(Modifier::BOLD),
-        ));
-        lines.push(Line::from(spans));
-    }
+                    "{:>total_width$}",
+                    format!(
+                        "{}/{}",
+                        calc::format_hm(row.worked_week),
+                        calc::format_hm(row.goal_week)
+                    )
+                ),
+                Style::default()
+                    .fg(total_color)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
 
-    let p = Paragraph::new(lines).block(gray_block(" History "));
+    let mut state = ListState::default();
+    if !rows.is_empty() {
+        state.select(Some(app.history_selected.min(rows.len() - 1)));
+    }
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner_chunks[1], &mut state);
+}
+
+/// The selected week's diagram, reusing the exact same per-day bar
+/// rendering (`week_lines`) as the dashboard's "This week" panel.
+fn draw_history_preview(f: &mut Frame, app: &App, area: Rect, rows: &[calc::WeekRow]) {
+    let Some(row) = rows.get(app.history_selected.min(rows.len().saturating_sub(1))) else {
+        return;
+    };
+    let inner_width = area.width.saturating_sub(2);
+    let lines = week_lines(app, row.week_start, inner_width);
+    let (_, week_end) = calc::week_bounds(row.week_start);
+    let title = format!(
+        " W{:02} ({} - {}) ",
+        row.week_start.iso_week().week(),
+        row.week_start.format("%b %d"),
+        week_end.format("%b %d")
+    );
+    let p = Paragraph::new(lines).block(gray_block(title));
     f.render_widget(p, area);
 }
 
@@ -1419,7 +1470,7 @@ fn history_cell_color(day: NaiveDate, today: NaiveDate, worked: i64, target: i64
 fn draw_history_footer(f: &mut Frame, area: Rect) {
     let p = Paragraph::new(hint_line(&[
         ("q", "quit"),
-        ("j/k", "scroll"),
+        ("j/k", "select week"),
         ("h/Esc", "back"),
         ("r", "reload"),
     ]));
