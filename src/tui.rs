@@ -97,9 +97,8 @@ enum Pane {
 }
 
 /// Which top-level view is showing. Dashboard/History are toggled with
-/// 'h'; Goals is reached with a key deliberately left out of the
-/// dashboard's footer hints (see `draw_footer`) - a hidden, power-user
-/// screen for managing the weekly goal over time.
+/// 'h'; Goals is reached via the Dashboard's "other" submenu ('o', then
+/// 'g' - see `App::other_menu_open`) rather than its own top-level key.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Screen {
     Dashboard,
@@ -126,6 +125,10 @@ struct App {
     history_selected: usize,
     /// Index (chronological) of the selected row in the Goals screen.
     goal_selected: usize,
+    /// True while the Dashboard's "other" submenu is open - swaps the
+    /// footer to that submenu's own keys (currently just 'g' for Goals)
+    /// instead of advertising them in the main hint line.
+    other_menu_open: bool,
     /// A transient footer message and when it was set, for `STATUS_DURATION`
     /// auto-dismissal - see `set_status`/`clear_expired_status`.
     status: Option<(StatusKind, String, Instant)>,
@@ -147,6 +150,7 @@ impl App {
             screen: Screen::Dashboard,
             history_selected: 0,
             goal_selected: 0,
+            other_menu_open: false,
             status: None,
             quit: false,
         };
@@ -761,6 +765,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
     match &mut app.mode {
         Mode::Normal => match app.screen {
+            Screen::Dashboard if app.other_menu_open => match code {
+                KeyCode::Char('g') => {
+                    app.other_menu_open = false;
+                    app.screen = Screen::Goals;
+                }
+                KeyCode::Esc => app.other_menu_open = false,
+                _ => {}
+            },
             Screen::Dashboard => match code {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                 KeyCode::Char('a') => app.open_add(),
@@ -769,9 +781,10 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
                 KeyCode::Char('r') => app.reload()?,
                 KeyCode::Char('h') => app.screen = Screen::History,
-                // Deliberately not in draw_footer's hints - a hidden,
-                // power-user screen for managing the goal over time.
-                KeyCode::Char('g') => app.screen = Screen::Goals,
+                // The submenu's own keys (currently just 'g' for Goals)
+                // aren't in draw_footer's hints - only "other" is, until
+                // this is pressed.
+                KeyCode::Char('o') => app.other_menu_open = true,
                 KeyCode::Tab => {
                     app.focus_pane = match app.focus_pane {
                         Pane::Days => Pane::Entries,
@@ -1316,6 +1329,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             ))
         }
+        None if app.other_menu_open => Paragraph::new(hint_line(&[("g", "goal"), ("Esc", "back")])),
         None => Paragraph::new(hint_line(&[
             ("q", "quit"),
             ("a", "add to this day"),
@@ -1325,6 +1339,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ("Tab", "switch pane"),
             ("j/k", "move"),
             ("h", "history"),
+            ("o", "other"),
             ("r", "reload"),
         ])),
     };

@@ -20,7 +20,8 @@ clockout goal edit <id> [...]  edit a goal period
 clockout goal delete <id>      delete a goal period
 ```
 
-In the TUI, press `h` to toggle the history view, or `g` to manage goal periods.
+In the TUI, press `h` to toggle the history view, or `o` then `g` to manage
+goal periods.
 
 ## Build
 
@@ -37,9 +38,10 @@ hide_weekends = false # Leave Saturday/Sunday out of the week diagram, day navig
 ```
 
 The weekly-hours goal isn't in `config.toml` - it lives in `entries.json` as
-a list of dated periods, managed with `clockout goal ...` or the TUI's `g`
-screen, so it can change over time (e.g. "6h/day starting next Monday")
-without rewriting the time debt already accrued under the old goal.
+a list of dated periods, managed with `clockout goal ...` or the TUI's Goals
+screen (`o` then `g`), so it can change over time (e.g. "6h/day starting
+next Monday") without rewriting the time debt already accrued under the old
+goal.
 
 ## LLM disclosure
 
