@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use clap::{Parser, Subcommand};
 
 use crate::calc;
@@ -40,6 +40,8 @@ pub enum Command {
     },
     /// Close the open block started with `clockout start` (default: now)
     End { time: Option<String> },
+    /// Close the open block (if any) and show where you stand for the day
+    Done { time: Option<String> },
     /// Print a one-shot plain-text summary
     Status,
     /// Launch the interactive dashboard (also the default with no subcommand)
@@ -111,6 +113,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         Command::Log { range, day, date } => cmd_log(range, day, date, today),
         Command::Start { time, day, date } => cmd_start(time, day, date, today),
         Command::End { time } => cmd_end(time),
+        Command::Done { time } => cmd_done(time, today),
         Command::Status => cmd_status(today),
         Command::Tui => crate::tui::run(),
         Command::List { all } => cmd_list(all, today),
@@ -227,14 +230,17 @@ fn cmd_start(
     Ok(())
 }
 
-fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
-    let (id, entry_date, start, end) = storage::with_entries(|data| {
-        let idx = data
-            .entries
-            .iter()
-            .position(|e| e.end.is_none())
-            .ok_or_else(|| anyhow::anyhow!("no open block - run `clockout start` first"))?;
-
+/// Closes the open block (if any) at `time` (parsed, default: now).
+/// Returns `None` if there was nothing open to close - not an error,
+/// since `cmd_done` treats "already clocked out" as fine. Shared by
+/// `cmd_end` (which errors on `None`) and `cmd_done` (which doesn't).
+fn close_open_block(
+    time: Option<String>,
+) -> anyhow::Result<Option<(u64, NaiveDate, NaiveTime, NaiveTime)>> {
+    storage::with_entries(|data| {
+        let Some(idx) = data.entries.iter().position(|e| e.end.is_none()) else {
+            return Ok(None);
+        };
         let end = match &time {
             Some(t) => parse::parse_time(t).map_err(|e| anyhow::anyhow!(e))?,
             None => Local::now().time(),
@@ -272,8 +278,13 @@ fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
         }
 
         data.entries[idx].end = Some(end);
-        Ok((id, entry_date, start, end))
-    })?;
+        Ok(Some((id, entry_date, start, end)))
+    })
+}
+
+fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
+    let (id, entry_date, start, end) = close_open_block(time)?
+        .ok_or_else(|| anyhow::anyhow!("no open block - run `clockout start` first"))?;
     println!(
         "ended #{}: {} {}-{}",
         id,
@@ -282,6 +293,24 @@ fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
         end.format("%H:%M")
     );
     Ok(())
+}
+
+/// Closes the open block at now (if any - a no-op otherwise, not an
+/// error), then shows the same summary `cmd_status` does. Nothing is
+/// "updated" beyond that write: the time debt/surplus shown is already
+/// always live-derived from entries, never stored - this just surfaces
+/// it at the moment you stop for the day.
+fn cmd_done(time: Option<String>, today: NaiveDate) -> anyhow::Result<()> {
+    if let Some((id, entry_date, start, end)) = close_open_block(time)? {
+        println!(
+            "ended #{}: {} {}-{}",
+            id,
+            entry_date,
+            start.format("%H:%M"),
+            end.format("%H:%M")
+        );
+    }
+    cmd_status(today)
 }
 
 fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {

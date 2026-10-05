@@ -4,20 +4,36 @@ CLI and TUI to track worked hours against a weekly goal, and see what time you c
 
 ## Usage
 
-```text
-clockout                       launch the TUI dashboard
-clockout start [HH:MM]         start an open block (default: now)
-clockout end [HH:MM]           close the open block (default: now)
-clockout log 8:00-12:00        log a finished range (--day/--date for other days)
-clockout status                one-shot text summary
-clockout list [--all]          list entries (this week, or --all)
-clockout history               weekly totals, one week per row, one day per column
-clockout edit <id> [...]       edit an entry
-clockout delete <id>           delete an entry
-clockout goal set <hours>      set the weekly-hours goal, effective from a date (--from, default: today)
-clockout goal list             list goal periods
-clockout goal edit <id> [...]  edit a goal period
-clockout goal delete <id>      delete a goal period
+### TUI
+
+```
+clockout
+```
+
+In the footer you can see the what key does what.
+
+### CLI
+
+```
+Usage: clockout [COMMAND]
+
+Commands:
+  log      Log a worked time range, e.g. `clockout log 8:00-12:00`
+  start    Start an open-ended block, e.g. `clockout start 12:35` (default: now)
+  end      Close the open block started with `clockout start` (default: now)
+  done     Close the open block (if any) and show where you stand for the day
+  status   Print a one-shot plain-text summary
+  tui      Launch the interactive dashboard (also the default with no subcommand)
+  list     List logged entries
+  history  Show weekly totals, one week per row and one day per column
+  edit     Edit an existing entry by id
+  delete   Delete an entry by id
+  goal     Manage the weekly-hours goal over time
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
 ```
 
 In the TUI, press `h` to toggle the history view, or `o` then `g` to manage

@@ -536,56 +536,69 @@ impl App {
                 return Ok(());
             }
         };
-        let result = storage::with_entries(|data| {
-            let Some(open) = calc::open_entry(&data.entries) else {
-                anyhow::bail!("no open block");
-            };
-            if time <= open.start {
-                anyhow::bail!("end must be after start");
-            }
-            let (id, date, start) = (open.id, open.date, open.start);
-            let candidate = TimeEntry {
-                id,
-                date,
-                start,
-                end: Some(time),
-            };
-            if let Some(conflict) = data
-                .entries
-                .iter()
-                .find(|e| e.id != id && e.date == date && calc::overlaps(e, &candidate))
-            {
-                anyhow::bail!(
-                    "overlaps existing entry #{} ({}-{})",
-                    conflict.id,
-                    conflict.start.format("%H:%M"),
-                    calc::format_end(conflict.end)
+        match close_open_block(time) {
+            Ok(Some((entries, start))) => {
+                self.entries = entries;
+                self.mode = Mode::Normal;
+                self.set_status(
+                    StatusKind::Info,
+                    format!(
+                        "finished {}-{}",
+                        start.format("%H:%M"),
+                        time.format("%H:%M")
+                    ),
                 );
             }
+            Ok(None) => self.set_modal_error("no open block".to_string()),
+            Err(e) => self.set_modal_error(e.to_string()),
+        }
+        Ok(())
+    }
 
-            if let Some(existing) = data.entries.iter_mut().find(|e| e.id == id) {
-                existing.end = Some(time);
-            }
-            Ok((data.entries.clone(), start))
-        });
-
-        let (entries, start) = match result {
-            Ok(v) => v,
+    /// "I'm done for the day": closes the open block at `now` (if any -
+    /// a no-op otherwise, not an error), then reports a one-line
+    /// end-of-day summary - hours worked vs target, and the resulting
+    /// time debt/surplus, which `done` doesn't compute or store anything
+    /// new for, it's already always live-derived from entries.
+    fn clock_out(&mut self) -> Result<()> {
+        let now = Local::now().time();
+        match close_open_block(now) {
+            Ok(Some((entries, _start))) => self.entries = entries,
+            Ok(None) => {}
             Err(e) => {
-                self.set_modal_error(e.to_string());
+                self.set_status(StatusKind::Error, e.to_string());
                 return Ok(());
             }
+        }
+
+        let today = self.today();
+        let worked_today =
+            calc::worked_minutes(&calc::entries_on(&self.entries, today), today, now);
+        let target_today = calc::daily_target_minutes(&self.goal_periods, today);
+        let debt = calc::time_debt_minutes(&self.entries, &self.goal_periods, today, now);
+        let tail = if debt > 0 {
+            format!(", time debt {}", calc::format_hm(debt))
+        } else {
+            let surplus = calc::time_surplus_minutes(&self.entries, &self.goal_periods, today, now);
+            if surplus > 0 {
+                format!(", -{} debt", calc::format_hm(surplus))
+            } else {
+                String::new()
+            }
         };
-        self.entries = entries;
-        self.mode = Mode::Normal;
-        self.set_status(
-            StatusKind::Info,
+        let summary = if target_today == 0 {
             format!(
-                "finished {}-{}",
-                start.format("%H:%M"),
-                time.format("%H:%M")
-            ),
-        );
+                "clocked out - logged {} (no target today)",
+                calc::format_hm(worked_today)
+            )
+        } else {
+            format!(
+                "clocked out - {} / {} today{tail}",
+                calc::format_hm(worked_today),
+                calc::format_hm(target_today),
+            )
+        };
+        self.set_status(StatusKind::Info, summary);
         Ok(())
     }
 
@@ -726,6 +739,49 @@ impl App {
     }
 }
 
+/// Closes the open block (if any) at `time`, persisting via
+/// `storage::with_entries`. Returns the updated entries and the closed
+/// block's start, or `Ok(None)` if there was nothing open to close - not
+/// an error, since `clock_out` treats "already clocked out" as fine.
+/// Shared by `submit_end` (via the End modal) and `App::clock_out` (no
+/// modal, always `now`), so both apply the same validation.
+fn close_open_block(time: NaiveTime) -> Result<Option<(Vec<TimeEntry>, NaiveTime)>> {
+    storage::with_entries(|data| {
+        let Some(idx) = data.entries.iter().position(|e| e.end.is_none()) else {
+            return Ok(None);
+        };
+        let (id, date, start) = (
+            data.entries[idx].id,
+            data.entries[idx].date,
+            data.entries[idx].start,
+        );
+        if time <= start {
+            anyhow::bail!("end must be after start");
+        }
+        let candidate = TimeEntry {
+            id,
+            date,
+            start,
+            end: Some(time),
+        };
+        if let Some(conflict) = data
+            .entries
+            .iter()
+            .find(|e| e.id != id && e.date == date && calc::overlaps(e, &candidate))
+        {
+            anyhow::bail!(
+                "overlaps existing entry #{} ({}-{})",
+                conflict.id,
+                conflict.start.format("%H:%M"),
+                calc::format_end(conflict.end)
+            );
+        }
+
+        data.entries[idx].end = Some(time);
+        Ok(Some((data.entries.clone(), start)))
+    })
+}
+
 pub fn run() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -777,6 +833,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 KeyCode::Char('q') | KeyCode::Esc => app.quit = true,
                 KeyCode::Char('a') => app.open_add(),
                 KeyCode::Char('f') => app.open_finish(),
+                KeyCode::Char('c') => app.clock_out()?,
                 KeyCode::Char('e') if app.focus_pane == Pane::Entries => app.open_edit(),
                 KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
                 KeyCode::Char('r') => app.reload()?,
@@ -1330,18 +1387,25 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             ))
         }
         None if app.other_menu_open => Paragraph::new(hint_line(&[("g", "goal"), ("Esc", "back")])),
-        None => Paragraph::new(hint_line(&[
-            ("q", "quit"),
-            ("a", "add to this day"),
-            ("f", "finish"),
-            ("e", "edit"),
-            ("d", "delete"),
-            ("Tab", "switch pane"),
-            ("j/k", "move"),
-            ("h", "history"),
-            ("o", "other"),
-            ("r", "reload"),
-        ])),
+        None => {
+            let mut hints: Vec<(&str, &str)> = vec![("q", "quit"), ("a", "add")];
+            // Only worth advertising once there's actually a block to
+            // finish - pressing it otherwise already shows a clear error.
+            if calc::open_entry(&app.entries).is_some() {
+                hints.push(("f", "finish block"));
+            }
+            hints.extend([
+                ("c", "clock out"),
+                ("e", "edit"),
+                ("d", "delete"),
+                ("Tab", "switch pane"),
+                ("j/k", "move"),
+                ("h", "history"),
+                ("o", "other"),
+                ("r", "reload"),
+            ]);
+            Paragraph::new(hint_line(&hints))
+        }
     };
     f.render_widget(p, area);
 }
