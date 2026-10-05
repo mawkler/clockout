@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::calc;
-use crate::model::{Config, TimeEntry};
+use crate::model::{Config, GoalPeriod, TimeEntry};
 use crate::parse;
 use crate::storage;
 
@@ -41,7 +41,16 @@ fn gray_block(title: impl Into<String>) -> Block<'static> {
 enum Mode {
     Normal,
     Modal(ModalState),
-    ConfirmDelete(u64),
+    ConfirmDelete(DeleteTarget),
+}
+
+/// What a confirmed delete removes - entries and goal periods are deleted
+/// through the same `y`/`n` confirm prompt, so this says which list (and
+/// which id in it) to act on.
+#[derive(Clone, Copy)]
+enum DeleteTarget {
+    Entry(u64),
+    GoalPeriod(u64),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -57,6 +66,8 @@ enum ModalKind {
     AddEdit,
     /// Single time field: close the currently open block.
     End,
+    /// Two-field form (date, hours) for adding/editing a goal period.
+    GoalPeriod,
 }
 
 struct ModalState {
@@ -67,7 +78,9 @@ struct ModalState {
     end_buf: String,
     /// The single time field used by the End modal.
     time_buf: String,
-    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End
+    /// The hours field used by the GoalPeriod modal.
+    hours_buf: String,
+    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End; 0=date, 1=hours for GoalPeriod
     /// True while the focused field's existing text hasn't been touched yet:
     /// it renders as selected, and the next keystroke overwrites it instead
     /// of appending (like a browser text input). Reset on every focus
@@ -83,15 +96,20 @@ enum Pane {
     Entries,
 }
 
-/// Which top-level view is showing. Toggled with 'h'.
+/// Which top-level view is showing. Dashboard/History are toggled with
+/// 'h'; Goals is reached with a key deliberately left out of the
+/// dashboard's footer hints (see `draw_footer`) - a hidden, power-user
+/// screen for managing the weekly goal over time.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Screen {
     Dashboard,
     History,
+    Goals,
 }
 
 struct App {
     entries: Vec<TimeEntry>,
+    goal_periods: Vec<GoalPeriod>,
     config: Config,
     /// The day whose entries show in the entries panel and whose row is
     /// marked in the week diagram. Defaults to today; moved with j/k while
@@ -106,6 +124,8 @@ struct App {
     /// Index (newest-first) of the selected row in the history view, for
     /// j/k and the week-diagram preview below it.
     history_selected: usize,
+    /// Index (chronological) of the selected row in the Goals screen.
+    goal_selected: usize,
     /// A transient footer message and when it was set, for `STATUS_DURATION`
     /// auto-dismissal - see `set_status`/`clear_expired_status`.
     status: Option<(StatusKind, String, Instant)>,
@@ -114,10 +134,11 @@ struct App {
 
 impl App {
     fn new() -> Result<Self> {
-        let entries = storage::load_entries()?.entries;
+        let data = storage::load_entries()?;
         let config = storage::load_config()?;
         let mut app = App {
-            entries,
+            entries: data.entries,
+            goal_periods: data.goal_periods,
             config,
             focused_day: Local::now().date_naive(),
             focus_pane: Pane::Entries,
@@ -125,6 +146,7 @@ impl App {
             mode: Mode::Normal,
             screen: Screen::Dashboard,
             history_selected: 0,
+            goal_selected: 0,
             status: None,
             quit: false,
         };
@@ -147,7 +169,9 @@ impl App {
     }
 
     fn reload(&mut self) -> Result<()> {
-        self.entries = storage::load_entries()?.entries;
+        let data = storage::load_entries()?;
+        self.entries = data.entries;
+        self.goal_periods = data.goal_periods;
         self.config = storage::load_config()?;
         let len = self.visible().len();
         if len == 0 {
@@ -157,6 +181,7 @@ impl App {
         }
         self.snap_focused_day();
         self.clamp_history_selection();
+        self.clamp_goal_selection();
         Ok(())
     }
 
@@ -256,6 +281,7 @@ impl App {
             start_buf: Local::now().time().format("%H:%M").to_string(),
             end_buf: String::new(),
             time_buf: String::new(),
+            hours_buf: String::new(),
             focus: 1,
             field_selected: true,
             error: None,
@@ -277,6 +303,7 @@ impl App {
                     .map(|t| t.format("%H:%M").to_string())
                     .unwrap_or_default(),
                 time_buf: String::new(),
+                hours_buf: String::new(),
                 focus,
                 field_selected: true,
                 error: None,
@@ -301,10 +328,78 @@ impl App {
             start_buf: String::new(),
             end_buf: String::new(),
             time_buf: Local::now().time().format("%H:%M").to_string(),
+            hours_buf: String::new(),
             focus: 0,
             field_selected: true,
             error: None,
         });
+    }
+
+    /// The Goals screen's periods, sorted chronologically (oldest first) -
+    /// unlike History's newest-first, this reads better as "how my goal
+    /// evolved over time."
+    fn visible_goal_periods(&self) -> Vec<&GoalPeriod> {
+        let mut v: Vec<&GoalPeriod> = self.goal_periods.iter().collect();
+        v.sort_by_key(|p| p.effective_from);
+        v
+    }
+
+    fn selected_goal_period(&self) -> Option<GoalPeriod> {
+        self.visible_goal_periods()
+            .get(self.goal_selected)
+            .map(|p| (*p).clone())
+    }
+
+    fn move_goal_selection(&mut self, delta: i32) {
+        let len = self.visible_goal_periods().len();
+        if len == 0 {
+            self.goal_selected = 0;
+            return;
+        }
+        let cur = self.goal_selected as i32 + delta;
+        self.goal_selected = cur.clamp(0, len as i32 - 1) as usize;
+    }
+
+    fn clamp_goal_selection(&mut self) {
+        let len = self.goal_periods.len();
+        if len == 0 {
+            self.goal_selected = 0;
+        } else if self.goal_selected >= len {
+            self.goal_selected = len - 1;
+        }
+    }
+
+    /// Open the add-goal-period modal, prefilled with today.
+    fn open_goal_add(&mut self) {
+        self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::GoalPeriod,
+            editing_id: None,
+            date_buf: self.today().to_string(),
+            start_buf: String::new(),
+            end_buf: String::new(),
+            time_buf: String::new(),
+            hours_buf: String::new(),
+            focus: 0,
+            field_selected: true,
+            error: None,
+        });
+    }
+
+    fn open_goal_edit(&mut self) {
+        if let Some(p) = self.selected_goal_period() {
+            self.mode = Mode::Modal(ModalState {
+                kind: ModalKind::GoalPeriod,
+                editing_id: Some(p.id),
+                date_buf: p.effective_from.to_string(),
+                start_buf: String::new(),
+                end_buf: String::new(),
+                time_buf: String::new(),
+                hours_buf: p.weekly_goal_hours.to_string(),
+                focus: 0,
+                field_selected: true,
+                error: None,
+            });
+        }
     }
 
     fn submit_modal(&mut self) -> Result<()> {
@@ -315,6 +410,7 @@ impl App {
         match kind {
             ModalKind::AddEdit => self.submit_add_edit(),
             ModalKind::End => self.submit_end(),
+            ModalKind::GoalPeriod => self.submit_goal_period(),
         }
     }
 
@@ -489,6 +585,68 @@ impl App {
         Ok(())
     }
 
+    /// Submits the goal-period modal: parses the date (same relative/ISO
+    /// fallback chain as `submit_add_edit`) and hours, rejects a duplicate
+    /// `effective_from` (`calc::goal_period_date_conflicts`), then either
+    /// updates the period being edited or appends a new one.
+    fn submit_goal_period(&mut self) -> Result<()> {
+        let Mode::Modal(m) = &self.mode else {
+            return Ok(());
+        };
+
+        let date = parse::resolve_day_spec(&m.date_buf, self.today()).or_else(|_| {
+            NaiveDate::parse_from_str(&m.date_buf, "%Y-%m-%d")
+                .map_err(|_| format!("invalid date '{}', expected YYYY-MM-DD", m.date_buf))
+        });
+        let date = match date {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_modal_error(e);
+                return Ok(());
+            }
+        };
+
+        let hours: f64 = match m.hours_buf.trim().parse() {
+            Ok(h) if h > 0.0 => h,
+            _ => {
+                self.set_modal_error("hours must be a positive number".to_string());
+                return Ok(());
+            }
+        };
+
+        let editing_id = m.editing_id;
+        let result = storage::with_entries(|data| {
+            if calc::goal_period_date_conflicts(&data.goal_periods, date, editing_id) {
+                anyhow::bail!("a goal period already starts {date}");
+            }
+            if let Some(id) = editing_id {
+                if let Some(existing) = data.goal_periods.iter_mut().find(|p| p.id == id) {
+                    existing.effective_from = date;
+                    existing.weekly_goal_hours = hours;
+                }
+            } else {
+                let id = data.next_id;
+                data.next_id += 1;
+                data.goal_periods.push(GoalPeriod {
+                    id,
+                    effective_from: date,
+                    weekly_goal_hours: hours,
+                });
+            }
+            Ok(data.goal_periods.clone())
+        });
+
+        match result {
+            Ok(goal_periods) => {
+                self.goal_periods = goal_periods;
+                self.mode = Mode::Normal;
+                self.set_status(StatusKind::Info, "saved");
+            }
+            Err(e) => self.set_modal_error(e.to_string()),
+        }
+        Ok(())
+    }
+
     fn set_modal_error(&mut self, err: String) {
         if let Mode::Modal(m) = &mut self.mode {
             m.error = Some(err);
@@ -497,18 +655,45 @@ impl App {
 
     fn request_delete(&mut self) {
         if let Some(e) = self.selected_entry() {
-            self.mode = Mode::ConfirmDelete(e.id);
+            self.mode = Mode::ConfirmDelete(DeleteTarget::Entry(e.id));
         }
     }
 
-    fn confirm_delete(&mut self, id: u64) -> Result<()> {
-        let entries = storage::with_entries(|data| {
-            data.entries.retain(|e| e.id != id);
-            Ok(data.entries.clone())
-        })?;
-        self.entries = entries;
-        self.mode = Mode::Normal;
-        self.set_status(StatusKind::Info, format!("deleted #{id}"));
+    fn request_goal_delete(&mut self) {
+        if let Some(p) = self.selected_goal_period() {
+            self.mode = Mode::ConfirmDelete(DeleteTarget::GoalPeriod(p.id));
+        }
+    }
+
+    fn confirm_delete(&mut self, target: DeleteTarget) -> Result<()> {
+        match target {
+            DeleteTarget::Entry(id) => {
+                let entries = storage::with_entries(|data| {
+                    data.entries.retain(|e| e.id != id);
+                    Ok(data.entries.clone())
+                })?;
+                self.entries = entries;
+                self.mode = Mode::Normal;
+                self.set_status(StatusKind::Info, format!("deleted #{id}"));
+            }
+            DeleteTarget::GoalPeriod(id) => {
+                let result = storage::with_entries(|data| {
+                    if data.goal_periods.len() <= 1 {
+                        anyhow::bail!("can't delete the only remaining goal period");
+                    }
+                    data.goal_periods.retain(|p| p.id != id);
+                    Ok(data.goal_periods.clone())
+                });
+                self.mode = Mode::Normal;
+                match result {
+                    Ok(goal_periods) => {
+                        self.goal_periods = goal_periods;
+                        self.set_status(StatusKind::Info, format!("deleted goal #{id}"));
+                    }
+                    Err(e) => self.set_status(StatusKind::Error, e.to_string()),
+                }
+            }
+        }
         Ok(())
     }
 
@@ -516,7 +701,7 @@ impl App {
     fn history_row_count(&self) -> usize {
         calc::history_weeks(
             &self.entries,
-            &self.config,
+            &self.goal_periods,
             self.today(),
             Local::now().time(),
         )
@@ -584,6 +769,9 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 KeyCode::Char('d') if app.focus_pane == Pane::Entries => app.request_delete(),
                 KeyCode::Char('r') => app.reload()?,
                 KeyCode::Char('h') => app.screen = Screen::History,
+                // Deliberately not in draw_footer's hints - a hidden,
+                // power-user screen for managing the goal over time.
+                KeyCode::Char('g') => app.screen = Screen::Goals,
                 KeyCode::Tab => {
                     app.focus_pane = match app.focus_pane {
                         Pane::Days => Pane::Entries,
@@ -608,11 +796,22 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 KeyCode::Char('k') | KeyCode::Up => app.move_history_selection(-1),
                 _ => {}
             },
+            Screen::Goals => match code {
+                KeyCode::Char('q') => app.quit = true,
+                KeyCode::Char('g') | KeyCode::Esc => app.screen = Screen::Dashboard,
+                KeyCode::Char('a') => app.open_goal_add(),
+                KeyCode::Char('e') => app.open_goal_edit(),
+                KeyCode::Char('d') => app.request_goal_delete(),
+                KeyCode::Char('r') => app.reload()?,
+                KeyCode::Char('j') | KeyCode::Down => app.move_goal_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => app.move_goal_selection(-1),
+                _ => {}
+            },
         },
-        Mode::ConfirmDelete(id) => {
-            let id = *id;
+        Mode::ConfirmDelete(target) => {
+            let target = *target;
             match code {
-                KeyCode::Char('y') => app.confirm_delete(id)?,
+                KeyCode::Char('y') => app.confirm_delete(target)?,
                 KeyCode::Char('n') | KeyCode::Esc => app.mode = Mode::Normal,
                 _ => {}
             }
@@ -621,6 +820,7 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
             let field_count = match m.kind {
                 ModalKind::AddEdit => 3,
                 ModalKind::End => 1,
+                ModalKind::GoalPeriod => 2,
             };
             match code {
                 KeyCode::Esc => app.mode = Mode::Normal,
@@ -665,6 +865,10 @@ fn current_buf(m: &mut ModalState) -> &mut String {
             _ => &mut m.end_buf,
         },
         ModalKind::End => &mut m.time_buf,
+        ModalKind::GoalPeriod => match m.focus {
+            0 => &mut m.date_buf,
+            _ => &mut m.hours_buf,
+        },
     }
 }
 
@@ -672,19 +876,20 @@ fn draw(f: &mut Frame, app: &App) {
     match app.screen {
         Screen::Dashboard => draw_dashboard(f, app),
         Screen::History => draw_history_screen(f, app),
+        Screen::Goals => draw_goals_screen(f, app),
     }
 
     match &app.mode {
         Mode::Modal(m) => draw_modal(f, m),
-        Mode::ConfirmDelete(id) => draw_confirm(f, *id),
+        Mode::ConfirmDelete(target) => draw_confirm(f, *target),
         Mode::Normal => {}
     }
 }
 
 fn draw_dashboard(f: &mut Frame, app: &App) {
     let now = Local::now().time();
-    let debt = calc::time_debt_minutes(&app.entries, &app.config, app.today(), now);
-    let surplus = calc::time_surplus_minutes(&app.entries, &app.config, app.today(), now);
+    let debt = calc::time_debt_minutes(&app.entries, &app.goal_periods, app.today(), now);
+    let surplus = calc::time_surplus_minutes(&app.entries, &app.goal_periods, app.today(), now);
     let stats_height = if debt > 0 || surplus > 0 { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -707,7 +912,7 @@ fn draw_dashboard(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let now = Local::now().time();
-    let target_today = calc::daily_target_minutes(&app.config, today);
+    let target_today = calc::daily_target_minutes(&app.goal_periods, today);
     let spans = if target_today == 0 {
         let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
         vec![
@@ -721,7 +926,7 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        let leave = calc::leave_time(&app.entries, &app.config, today, now);
+        let leave = calc::leave_time(&app.entries, &app.goal_periods, &app.config, today, now);
         vec![
             Span::styled(
                 "Leave at ",
@@ -744,15 +949,16 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64, surplus: i64) {
     let today = app.today();
     let now = Local::now().time();
     let worked_today = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
-    let target_today = calc::daily_target_minutes(&app.config, today);
-    let left_today = calc::minutes_left_today(&app.entries, &app.config, today, now);
+    let target_today = calc::daily_target_minutes(&app.goal_periods, today);
+    let left_today = calc::minutes_left_today(&app.entries, &app.goal_periods, today, now);
 
     let (week_start, _) = calc::week_bounds(today);
     let worked_week =
         calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start), today, now);
-    let goal_week = calc::weekly_goal_minutes(&app.config);
-    let left_week = calc::minutes_left_week(&app.entries, &app.config, today, now);
-    let clear_debt_by = calc::leave_time_debt(&app.entries, &app.config, today, now);
+    let goal_week = calc::weekly_goal_minutes_for_week(&app.goal_periods, week_start);
+    let left_week = calc::minutes_left_week(&app.entries, &app.goal_periods, today, now);
+    let clear_debt_by =
+        calc::leave_time_debt(&app.entries, &app.goal_periods, &app.config, today, now);
 
     let label = Style::default().fg(LABEL);
     let value = Style::default().add_modifier(Modifier::BOLD);
@@ -1179,6 +1385,7 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
     match m.kind {
         ModalKind::AddEdit => draw_add_edit_modal(f, m),
         ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time"),
+        ModalKind::GoalPeriod => draw_goal_period_modal(f, m),
     }
 }
 
@@ -1290,15 +1497,78 @@ fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
     );
 }
 
-fn draw_confirm(f: &mut Frame, id: u64) {
+fn draw_goal_period_modal(f: &mut Frame, m: &ModalState) {
+    let area = centered_rect(46, 8, f.area());
+    f.render_widget(Clear, area);
+
+    let title = if m.editing_id.is_some() {
+        " Edit goal period "
+    } else {
+        " Add goal period "
+    };
+    let block = gray_block(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    f.render_widget(
+        Paragraph::new(field_line(
+            "From",
+            &m.date_buf,
+            m.focus == 0,
+            m.field_selected,
+        )),
+        chunks[0],
+    );
+    f.render_widget(
+        Paragraph::new(field_line(
+            "Hours/week",
+            &m.hours_buf,
+            m.focus == 1,
+            m.field_selected,
+        )),
+        chunks[1],
+    );
+    if let Some(err) = &m.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                err.as_str(),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )),
+            chunks[2],
+        );
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "Tab: next field | Enter: save | Esc: cancel",
+            Style::default().fg(MUTED),
+        )),
+        chunks[3],
+    );
+}
+
+fn draw_confirm(f: &mut Frame, target: DeleteTarget) {
     let area = centered_rect(40, 3, f.area());
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(DANGER))
         .title(" Confirm ");
+    let (label, id) = match target {
+        DeleteTarget::Entry(id) => ("Delete entry ", id),
+        DeleteTarget::GoalPeriod(id) => ("Delete goal period ", id),
+    };
     let p = Paragraph::new(Line::from(vec![
-        Span::raw("Delete entry "),
+        Span::raw(label),
         Span::styled(
             format!("#{id}"),
             Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
@@ -1315,7 +1585,7 @@ const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 fn draw_history_screen(f: &mut Frame, app: &App) {
     let today = app.today();
     let now = Local::now().time();
-    let mut rows = calc::history_weeks(&app.entries, &app.config, today, now);
+    let mut rows = calc::history_weeks(&app.entries, &app.goal_periods, today, now);
     rows.reverse(); // newest first
 
     let chunks = Layout::default()
@@ -1388,7 +1658,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect, rows: &[calc::WeekRow]) {
             let mut spans = vec![Span::styled(label, label_style)];
             for &i in &day_indices {
                 let (day, worked) = row.day_totals[i];
-                let target = calc::daily_target_minutes(&app.config, day);
+                let target = calc::daily_target_minutes(&app.goal_periods, day);
                 let color = history_cell_color(day, today, worked, target);
                 let text = if day > today {
                     "-".to_string()
@@ -1472,6 +1742,104 @@ fn draw_history_footer(f: &mut Frame, area: Rect) {
         ("q", "quit"),
         ("j/k", "select week"),
         ("h/Esc", "back"),
+        ("r", "reload"),
+    ]));
+    f.render_widget(p, area);
+}
+
+fn draw_goals_screen(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(f.area());
+
+    draw_goals(f, app, chunks[0]);
+    draw_goals_footer(f, chunks[1]);
+}
+
+/// A selectable list of every goal period, oldest first (reads as a
+/// timeline of how the goal evolved), the one currently in effect
+/// highlighted with the same black-on-accent background History uses for
+/// the current week. a/e/d add, edit, and delete the selected period.
+fn draw_goals(f: &mut Frame, app: &App, area: Rect) {
+    let today = app.today();
+    let periods = app.visible_goal_periods();
+    let current_id = calc::current_goal_period(&app.goal_periods, today).map(|p| p.id);
+
+    let label_width = 17usize;
+    let hours_width = 10usize;
+
+    let mut header_spans = vec![Span::styled(
+        format!("{:<label_width$}", "Effective from"),
+        Style::default().fg(LABEL),
+    )];
+    header_spans.push(Span::styled(
+        format!("{:>hours_width$}", "Hours/week"),
+        Style::default().fg(LABEL),
+    ));
+
+    let block = gray_block(" Goals ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let inner_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(inner);
+    f.render_widget(Paragraph::new(Line::from(header_spans)), inner_chunks[0]);
+
+    let items: Vec<ListItem> = periods
+        .iter()
+        .map(|p| {
+            let label_style = if Some(p.id) == current_id {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(LABEL)
+            };
+            let spans = vec![
+                Span::styled(
+                    format!("{:<label_width$}", p.effective_from.to_string()),
+                    label_style,
+                ),
+                Span::styled(
+                    format!("{:>hours_width$}", format!("{}h", p.weekly_goal_hours)),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let no_periods = items.is_empty();
+    let items = if no_periods {
+        vec![ListItem::new(Span::styled(
+            "no goal periods",
+            Style::default().fg(MUTED),
+        ))]
+    } else {
+        items
+    };
+
+    let mut state = ListState::default();
+    if no_periods {
+        state.select(Some(0));
+    } else {
+        state.select(Some(app.goal_selected.min(periods.len() - 1)));
+    }
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner_chunks[1], &mut state);
+}
+
+fn draw_goals_footer(f: &mut Frame, area: Rect) {
+    let p = Paragraph::new(hint_line(&[
+        ("q", "quit"),
+        ("a", "add"),
+        ("e", "edit"),
+        ("d", "delete"),
+        ("j/k", "select"),
+        ("g/Esc", "back"),
         ("r", "reload"),
     ]));
     f.render_widget(p, area);

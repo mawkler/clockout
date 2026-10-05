@@ -2,7 +2,7 @@ use chrono::{Datelike, Local, NaiveDate};
 use clap::{Parser, Subcommand};
 
 use crate::calc;
-use crate::model::TimeEntry;
+use crate::model::{GoalPeriod, TimeEntry};
 use crate::parse;
 use crate::storage;
 
@@ -62,6 +62,33 @@ pub enum Command {
     },
     /// Delete an entry by id
     Delete { id: u64 },
+    /// Manage the weekly-hours goal over time
+    Goal {
+        #[command(subcommand)]
+        action: GoalCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum GoalCommand {
+    /// Set a new weekly-hours goal, effective from a date (default: today)
+    Set {
+        hours: f64,
+        #[arg(long)]
+        from: Option<NaiveDate>,
+    },
+    /// List all goal periods
+    List,
+    /// Edit an existing goal period by id
+    Edit {
+        id: u64,
+        #[arg(long)]
+        hours: Option<f64>,
+        #[arg(long)]
+        from: Option<NaiveDate>,
+    },
+    /// Delete a goal period by id
+    Delete { id: u64 },
 }
 
 fn resolve_date(
@@ -90,6 +117,7 @@ pub fn run(command: Command) -> anyhow::Result<()> {
         Command::History => cmd_history(today),
         Command::Edit { id, range, date } => cmd_edit(id, range, date),
         Command::Delete { id } => cmd_delete(id),
+        Command::Goal { action } => cmd_goal(action, today),
     }
 }
 
@@ -262,8 +290,8 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     let now = Local::now().time();
 
     let worked_today = calc::worked_minutes(&calc::entries_on(&data.entries, today), today, now);
-    let target_today = calc::daily_target_minutes(&cfg, today);
-    let left_today = calc::minutes_left_today(&data.entries, &cfg, today, now);
+    let target_today = calc::daily_target_minutes(&data.goal_periods, today);
+    let left_today = calc::minutes_left_today(&data.entries, &data.goal_periods, today, now);
 
     let (week_start, _) = calc::week_bounds(today);
     let worked_week = calc::worked_minutes(
@@ -271,14 +299,14 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         today,
         now,
     );
-    let goal_week = calc::weekly_goal_minutes(&cfg);
-    let left_week = calc::minutes_left_week(&data.entries, &cfg, today, now);
+    let goal_week = calc::weekly_goal_minutes_for_week(&data.goal_periods, week_start);
+    let left_week = calc::minutes_left_week(&data.entries, &data.goal_periods, today, now);
 
     println!("{} ({})", today, today.format("%A"));
     if target_today == 0 {
         println!("No target today — logged {}", calc::format_hm(worked_today));
     } else {
-        let leave = calc::leave_time(&data.entries, &cfg, today, now);
+        let leave = calc::leave_time(&data.entries, &data.goal_periods, &cfg, today, now);
         println!(
             "Today:     {} / {} target ({} left)",
             calc::format_hm(worked_today),
@@ -293,16 +321,17 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         calc::format_hm(goal_week),
         calc::format_hm(left_week)
     );
-    let debt = calc::time_debt_minutes(&data.entries, &cfg, today, now);
+    let debt = calc::time_debt_minutes(&data.entries, &data.goal_periods, today, now);
     if debt > 0 {
-        let clear_debt_by = calc::leave_time_debt(&data.entries, &cfg, today, now);
+        let clear_debt_by =
+            calc::leave_time_debt(&data.entries, &data.goal_periods, &cfg, today, now);
         println!(
             "Time debt: {} · clear by {}",
             calc::format_hm(debt),
             clear_debt_by.format("%H:%M")
         );
     } else {
-        let surplus = calc::time_surplus_minutes(&data.entries, &cfg, today, now);
+        let surplus = calc::time_surplus_minutes(&data.entries, &data.goal_periods, today, now);
         if surplus > 0 {
             println!("Time debt: -{}", calc::format_hm(surplus));
         }
@@ -358,7 +387,7 @@ fn cmd_history(today: NaiveDate) -> anyhow::Result<()> {
     println!("{:>12}", "Total");
 
     let (current_week_start, _) = calc::week_bounds(today);
-    let rows = calc::history_weeks(&data.entries, &cfg, today, now);
+    let rows = calc::history_weeks(&data.entries, &data.goal_periods, today, now);
     for row in rows.iter().rev() {
         let marker = if row.week_start == current_week_start {
             "*"
@@ -446,5 +475,111 @@ fn cmd_delete(id: u64) -> anyhow::Result<()> {
         Ok(())
     })?;
     println!("deleted #{id}");
+    Ok(())
+}
+
+fn cmd_goal(action: GoalCommand, today: NaiveDate) -> anyhow::Result<()> {
+    match action {
+        GoalCommand::Set { hours, from } => cmd_goal_set(hours, from, today),
+        GoalCommand::List => cmd_goal_list(today),
+        GoalCommand::Edit { id, hours, from } => cmd_goal_edit(id, hours, from),
+        GoalCommand::Delete { id } => cmd_goal_delete(id),
+    }
+}
+
+fn cmd_goal_set(hours: f64, from: Option<NaiveDate>, today: NaiveDate) -> anyhow::Result<()> {
+    if hours <= 0.0 {
+        anyhow::bail!("hours must be positive");
+    }
+    let effective_from = from.unwrap_or(today);
+    let period = storage::with_entries(|data| {
+        if calc::goal_period_date_conflicts(&data.goal_periods, effective_from, None) {
+            anyhow::bail!(
+                "a goal period already starts {effective_from} - use `clockout goal edit` instead"
+            );
+        }
+        let period = GoalPeriod {
+            id: data.next_id,
+            effective_from,
+            weekly_goal_hours: hours,
+        };
+        data.next_id += 1;
+        data.goal_periods.push(period.clone());
+        Ok(period)
+    })?;
+    println!(
+        "set goal #{}: {}h/week from {}",
+        period.id, period.weekly_goal_hours, period.effective_from
+    );
+    Ok(())
+}
+
+fn cmd_goal_list(today: NaiveDate) -> anyhow::Result<()> {
+    let data = storage::load_entries()?;
+    let mut periods: Vec<&GoalPeriod> = data.goal_periods.iter().collect();
+    periods.sort_by_key(|p| p.effective_from);
+    if periods.is_empty() {
+        println!("no goal periods");
+        return Ok(());
+    }
+    let current_id = calc::current_goal_period(&data.goal_periods, today).map(|p| p.id);
+    for p in periods {
+        let marker = if Some(p.id) == current_id { "*" } else { " " };
+        println!(
+            "#{:<4} {} {}h/week{marker}",
+            p.id, p.effective_from, p.weekly_goal_hours
+        );
+    }
+    Ok(())
+}
+
+fn cmd_goal_edit(id: u64, hours: Option<f64>, from: Option<NaiveDate>) -> anyhow::Result<()> {
+    if let Some(hours) = hours
+        && hours <= 0.0
+    {
+        anyhow::bail!("hours must be positive");
+    }
+    let updated = storage::with_entries(|data| {
+        let idx = data
+            .goal_periods
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| anyhow::anyhow!("no goal period with id {id}"))?;
+
+        let mut updated = data.goal_periods[idx].clone();
+        if let Some(hours) = hours {
+            updated.weekly_goal_hours = hours;
+        }
+        if let Some(from) = from {
+            updated.effective_from = from;
+        }
+
+        if calc::goal_period_date_conflicts(&data.goal_periods, updated.effective_from, Some(id)) {
+            anyhow::bail!("a goal period already starts {}", updated.effective_from);
+        }
+
+        data.goal_periods[idx] = updated.clone();
+        Ok(updated)
+    })?;
+    println!(
+        "updated goal #{}: {}h/week from {}",
+        updated.id, updated.weekly_goal_hours, updated.effective_from
+    );
+    Ok(())
+}
+
+fn cmd_goal_delete(id: u64) -> anyhow::Result<()> {
+    storage::with_entries(|data| {
+        if data.goal_periods.len() <= 1 {
+            anyhow::bail!("can't delete the only remaining goal period");
+        }
+        let len_before = data.goal_periods.len();
+        data.goal_periods.retain(|p| p.id != id);
+        if data.goal_periods.len() == len_before {
+            anyhow::bail!("no goal period with id {id}");
+        }
+        Ok(())
+    })?;
+    println!("deleted goal #{id}");
     Ok(())
 }

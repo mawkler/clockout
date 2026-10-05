@@ -17,19 +17,39 @@ pub struct TimeEntry {
     pub end: Option<NaiveTime>,
 }
 
+/// One era of the weekly-hours goal: `weekly_goal_hours` applies from
+/// `effective_from` (inclusive) until the next period's `effective_from`,
+/// or indefinitely if it's the latest one. See `calc::goal_hours_for`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalPeriod {
+    pub id: u64,
+    pub effective_from: NaiveDate,
+    pub weekly_goal_hours: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntriesFile {
     pub version: u32,
     pub next_id: u64,
     pub entries: Vec<TimeEntry>,
+    #[serde(default)]
+    pub goal_periods: Vec<GoalPeriod>,
 }
 
 impl Default for EntriesFile {
     fn default() -> Self {
         EntriesFile {
             version: 1,
-            next_id: 1,
+            next_id: 2, // id 1 is used by the seeded period below
             entries: Vec::new(),
+            goal_periods: vec![GoalPeriod {
+                id: 1,
+                // Placeholder - irrelevant which date, since the earliest
+                // period always applies retroactively (see
+                // calc::goal_hours_for).
+                effective_from: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
+                weekly_goal_hours: 40.0,
+            }],
         }
     }
 }
@@ -40,7 +60,6 @@ fn default_estimated_lunch_break() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub weekly_goal_hours: f64,
     #[serde(default = "default_estimated_lunch_break")]
     pub estimated_lunch_break_minutes: u32,
     /// If true, Saturday and Sunday are left out of the week diagram, day
@@ -53,7 +72,6 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            weekly_goal_hours: 40.0,
             estimated_lunch_break_minutes: default_estimated_lunch_break(),
             hide_weekends: false,
         }
