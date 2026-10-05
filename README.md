@@ -6,6 +6,8 @@ CLI and TUI to track worked hours against a weekly goal, and see what time you c
 
 ### TUI
 
+Run it without any arguments to start the TUI:
+
 ```
 clockout
 ```
@@ -13,6 +15,8 @@ clockout
 In the footer you can see the what key does what.
 
 ### CLI
+
+There's also a CLI:
 
 ```
 Usage: clockout [COMMAND]
@@ -37,39 +41,34 @@ Options:
   -V, --version  Print version
 ```
 
-In the TUI, press `h` to toggle the history view, or `o` then `g` to manage
-goal periods. To mark a day absent instead of logging time for it, open the
-add popup (`a`) and press Alt+a to flip it into absence mode (date +
-optional reason) - whole-day by default, or press Alt+t to fill in a time
-interval instead (e.g. a couple of hours for an appointment).
+## Running/installing
 
-## Build
+Run with Nix:
 
-Standard `cargo build --release`, or with Nix: `nix build` (or `nix run` /
-`nix develop` for a dev shell).
+```sh
+nix run github:mawkler/clockout
+```
+
+Alternatively, install with cargo:
+
+```sh
+git clone https://github.com/mawkler/clockout
+cargo install --path clockout/
+```
 
 ## Config
 
-Configuration in `~/.config/clockout/config.toml`. For example:
+Configuration lives in `~/.config/clockout/config.toml`. Here's the default config:
 
 ```toml
-estimated_lunch_break_minutes = 30 # Assumed lunch break time, used for estimation
-hide_weekends = false # Leave Saturday/Sunday out of the week diagram, day navigation, and history view
-round_to_minutes = 5 # Round a suggested time (e.g. a new entry's "Start", prefilled with now) to the nearest 5 minutes - 1 (the default) means no rounding
+# Assumed lunch break time, used for estimating "leave at" before you've had your break(s)
+estimated_lunch_break_minutes = 30
+# Hide Saturday and Sunday
+hide_weekends = false
+# Round suggested time to the nearest 1 minutes
+round_to_minutes = 1
 ```
-
-The weekly-hours goal isn't in `config.toml` - it lives in `entries.json` as
-a list of dated periods, managed with `clockout goal ...` or the TUI's Goals
-screen (`o` then `g`), so it can change over time (e.g. "6h/day starting
-next Monday") without rewriting the time debt already accrued under the old
-goal.
-
-Absences (sick days, vacation, etc.) also live in `entries.json`, managed
-with `clockout absence ...` or the TUI's add popup (Alt+a). A day marked
-absent owes nothing toward the goal and doesn't accrue time debt; the TUI
-also supports a partial-day absence (a time interval), which reduces that
-day's target by the interval's duration instead of zeroing it.
 
 ## LLM disclosure
 
-This program is heavily AI proompted.
+This program is mostly AI proompted.
