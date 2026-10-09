@@ -265,6 +265,14 @@ pub fn today_gaps(entries: &[TimeEntry], day: NaiveDate) -> Vec<(NaiveTime, Naiv
 /// beyond what's already implied by logged entries. If today has no logged
 /// gap yet, `estimated_lunch_break_minutes` from config is added as an
 /// anticipated break; once a real gap is logged, it supersedes the guess.
+///
+/// Any banked surplus (negative time debt - see `time_surplus_minutes`)
+/// offsets what's left of today's own target, so being ahead overall lets
+/// you leave earlier today - not just show up as a bigger number on the
+/// "clear by" projection, which only ever applies once you're behind.
+/// Floors at `now`: a surplus big enough to have already covered today's
+/// whole target (or more) means "you could leave right now", never a time
+/// in the past.
 pub fn leave_time(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
@@ -272,13 +280,10 @@ pub fn leave_time(
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
-    leave_time_after(
-        minutes_left_today(entries, goal_periods, today, now),
-        entries,
-        cfg,
-        today,
-        now,
-    )
+    let left_today = minutes_left_today(entries, goal_periods, today, now);
+    let surplus = time_surplus_minutes(entries, goal_periods, today, now);
+    let minutes_owed = (left_today - surplus).max(0);
+    leave_time_after(minutes_owed, entries, cfg, today, now)
 }
 
 /// Clock time you'd need to work until today to pay off the current time
@@ -975,6 +980,49 @@ mod tests {
         let entries = vec![entry(1, d, "08:00", "16:00")];
         let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
         assert_eq!(leave_time_debt(&entries, &g, &c, d, now), now);
+    }
+
+    #[test]
+    fn leave_time_subtracts_banked_surplus_from_todays_target() {
+        let c = cfg(0); // no break padding
+        let g = goal_periods(40.0); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "08:00", "20:00"), // Mon, 12h, surplus 4h (240min)
+            entry(2, date(2026, 9, 8), "08:00", "10:00"), // Tue, 2h so far
+        ];
+        let tuesday = date(2026, 9, 8);
+        let now = NaiveTime::parse_from_str("10:00", "%H:%M").unwrap();
+        // left_today would be 6h (8h target - 2h worked), but the 4h
+        // banked from Monday's surplus knocks that down to 2h.
+        let surplus = time_surplus_minutes(&entries, &g, tuesday, now);
+        assert_eq!(
+            surplus, 240,
+            "test needs a nonzero surplus to be meaningful"
+        );
+        assert_eq!(
+            leave_time(&entries, &g, &c, tuesday, now),
+            NaiveTime::parse_from_str("12:00", "%H:%M").unwrap()
+        );
+    }
+
+    #[test]
+    fn leave_time_floors_at_now_when_surplus_exceeds_todays_target() {
+        let c = cfg(0);
+        let g = goal_periods(40.0); // 8h/day target
+        let entries = vec![
+            entry(1, date(2026, 9, 7), "06:00", "22:00"), // Mon, 16h, surplus 8h
+        ];
+        let tuesday = date(2026, 9, 8);
+        let now = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
+        // Nothing worked yet today (left_today = 8h), but Monday's 8h
+        // surplus fully covers it - "leave at" floors at `now` rather than
+        // going negative/into the past.
+        let surplus = time_surplus_minutes(&entries, &g, tuesday, now);
+        assert!(
+            surplus >= 8 * 60,
+            "test needs a surplus covering the whole 8h target"
+        );
+        assert_eq!(leave_time(&entries, &g, &c, tuesday, now), now);
     }
 
     #[test]
