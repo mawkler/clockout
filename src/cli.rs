@@ -335,14 +335,18 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     if target_today == 0 {
         println!("No target today — logged {}", calc::format_hm(worked_today));
     } else {
-        let leave = calc::leave_time(&data.entries, &data.goal_periods, &cfg, today, now);
         println!(
             "Today:     {} / {} target ({} left)",
             calc::format_hm(worked_today),
             calc::format_hm(target_today),
             calc::format_hm(left_today)
         );
-        println!("Leave at:  {}", leave.format("%H:%M"));
+        if let Some(clocked_out) = calc::clocked_out_at(&data.entries, today) {
+            println!("Clocked out: {}", clocked_out.format("%H:%M"));
+        } else {
+            let leave = calc::leave_time(&data.entries, &data.goal_periods, &cfg, today, now);
+            println!("Leave at:  {}", leave.format("%H:%M"));
+        }
     }
     println!(
         "This week: {} / {} goal ({} left)",

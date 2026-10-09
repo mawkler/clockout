@@ -104,6 +104,22 @@ pub fn entries_on(entries: &[TimeEntry], day: NaiveDate) -> Vec<&TimeEntry> {
     entries.iter().filter(|e| e.date == day).collect()
 }
 
+/// If you're done for the day - nothing currently open, and at least one
+/// closed entry logged for `today` - the clock time the last one ended.
+/// `None` while still actively working (an open block, on any day) or
+/// before you've logged anything today at all, so callers can show this
+/// instead of a "Leave at" projection only once there's actually
+/// something to report as "clocked out at".
+pub fn clocked_out_at(entries: &[TimeEntry], today: NaiveDate) -> Option<NaiveTime> {
+    if open_entry(entries).is_some() {
+        return None;
+    }
+    entries_on(entries, today)
+        .into_iter()
+        .filter_map(|e| e.end)
+        .max()
+}
+
 pub fn entries_in_week(entries: &[TimeEntry], week_start: NaiveDate) -> Vec<&TimeEntry> {
     let week_end = week_start + Duration::days(6);
     entries
@@ -1157,6 +1173,35 @@ mod tests {
         assert_eq!(open_entry(&[]), None);
         let entries = vec![entry(1, d, "08:00", "12:00"), open(2, d, "12:35")];
         assert_eq!(open_entry(&entries).map(|e| e.id), Some(2));
+    }
+
+    #[test]
+    fn clocked_out_at_none_before_anything_logged_today() {
+        let today = date(2026, 9, 11);
+        assert_eq!(clocked_out_at(&[], today), None);
+    }
+
+    #[test]
+    fn clocked_out_at_none_while_a_block_is_open() {
+        let today = date(2026, 9, 11);
+        let entries = vec![open(1, today, "08:00")];
+        assert_eq!(clocked_out_at(&entries, today), None);
+        // Even an open block from a past day still counts as "still going".
+        let entries = vec![open(1, date(2026, 9, 10), "22:00")];
+        assert_eq!(clocked_out_at(&entries, today), None);
+    }
+
+    #[test]
+    fn clocked_out_at_latest_end_once_closed_for_the_day() {
+        let today = date(2026, 9, 11);
+        let entries = vec![
+            entry(1, today, "08:00", "12:00"),
+            entry(2, today, "13:00", "17:00"),
+        ];
+        assert_eq!(
+            clocked_out_at(&entries, today),
+            Some(NaiveTime::parse_from_str("17:00", "%H:%M").unwrap())
+        );
     }
 
     #[test]

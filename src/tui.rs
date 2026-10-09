@@ -995,6 +995,17 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]
+    } else if let Some(clocked_out) = calc::clocked_out_at(&app.entries, today) {
+        vec![
+            Span::styled(
+                "Clocked out at ",
+                Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                clocked_out.format("%H:%M").to_string(),
+                Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD),
+            ),
+        ]
     } else {
         let leave = calc::leave_time(&app.entries, &app.goal_periods, &app.config, today, now);
         vec![
