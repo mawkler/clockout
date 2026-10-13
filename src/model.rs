@@ -27,6 +27,18 @@ pub struct GoalPeriod {
     pub weekly_goal_hours: f64,
 }
 
+/// A single day you were absent (sick, vacation, etc.) and so don't owe a
+/// target for, even on a weekday. Doesn't touch `entries` at all - purely
+/// zeroes that day's contribution in `calc::daily_target_minutes`. See
+/// `calc::is_absent`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Absence {
+    pub id: u64,
+    pub date: NaiveDate,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntriesFile {
     pub version: u32,
@@ -34,6 +46,8 @@ pub struct EntriesFile {
     pub entries: Vec<TimeEntry>,
     #[serde(default)]
     pub goal_periods: Vec<GoalPeriod>,
+    #[serde(default)]
+    pub absences: Vec<Absence>,
 }
 
 impl Default for EntriesFile {
@@ -50,6 +64,7 @@ impl Default for EntriesFile {
                 effective_from: NaiveDate::from_ymd_opt(1970, 1, 1).unwrap(),
                 weekly_goal_hours: 40.0,
             }],
+            absences: Vec::new(),
         }
     }
 }

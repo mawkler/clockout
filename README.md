@@ -29,6 +29,7 @@ Commands:
   edit     Edit an existing entry by id
   delete   Delete an entry by id
   goal     Manage the weekly-hours goal over time
+  absence  Record absences (sick days, vacation, etc.) that don't accrue time debt
   help     Print this message or the help of the given subcommand(s)
 
 Options:
@@ -37,7 +38,9 @@ Options:
 ```
 
 In the TUI, press `h` to toggle the history view, or `o` then `g` to manage
-goal periods.
+goal periods. To mark a day absent instead of logging time for it, open the
+add popup (`a`) and press Alt+a to flip it into absence mode (date +
+optional reason).
 
 ## Build
 
@@ -58,6 +61,10 @@ a list of dated periods, managed with `clockout goal ...` or the TUI's Goals
 screen (`o` then `g`), so it can change over time (e.g. "6h/day starting
 next Monday") without rewriting the time debt already accrued under the old
 goal.
+
+Absences (sick days, vacation, etc.) also live in `entries.json`, managed
+with `clockout absence ...` or the TUI's add popup (Alt+a). A day marked
+absent owes nothing toward the goal and doesn't accrue time debt.
 
 ## LLM disclosure
 

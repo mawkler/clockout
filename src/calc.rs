@@ -1,6 +1,6 @@
 use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
 
-use crate::model::{Config, GoalPeriod, TimeEntry};
+use crate::model::{Absence, Config, GoalPeriod, TimeEntry};
 
 /// Minutes worked by this entry as of `now`. A closed entry (it has a
 /// stored end) always counts in full, whatever that end is - even one
@@ -62,7 +62,37 @@ fn goal_hours_for(goal_periods: &[GoalPeriod], day: NaiveDate) -> f64 {
         .unwrap_or(40.0)
 }
 
-pub fn daily_target_minutes(goal_periods: &[GoalPeriod], day: NaiveDate) -> i64 {
+/// True if `day` has a recorded absence.
+pub fn is_absent(absences: &[Absence], day: NaiveDate) -> bool {
+    absences.iter().any(|a| a.date == day)
+}
+
+/// The absence recorded for `day`, if any.
+pub fn absence_on(absences: &[Absence], day: NaiveDate) -> Option<&Absence> {
+    absences.iter().find(|a| a.date == day)
+}
+
+/// True if `candidate_date` already has a recorded absence (excluding
+/// `excluding_id`, so editing one in place doesn't trip over itself).
+/// Mirrors `goal_period_date_conflicts`.
+pub fn absence_date_conflicts(
+    absences: &[Absence],
+    candidate_date: NaiveDate,
+    excluding_id: Option<u64>,
+) -> bool {
+    absences
+        .iter()
+        .any(|a| Some(a.id) != excluding_id && a.date == candidate_date)
+}
+
+pub fn daily_target_minutes(
+    goal_periods: &[GoalPeriod],
+    absences: &[Absence],
+    day: NaiveDate,
+) -> i64 {
+    if is_absent(absences, day) {
+        return 0;
+    }
     match day.weekday() {
         Weekday::Sat | Weekday::Sun => 0,
         _ => {
@@ -74,9 +104,13 @@ pub fn daily_target_minutes(goal_periods: &[GoalPeriod], day: NaiveDate) -> i64 
 
 /// Sum of `week_start`'s week's daily targets - correctly reflects a goal
 /// change landing mid-week, not just one aligned to a Monday.
-pub fn weekly_goal_minutes_for_week(goal_periods: &[GoalPeriod], week_start: NaiveDate) -> i64 {
+pub fn weekly_goal_minutes_for_week(
+    goal_periods: &[GoalPeriod],
+    absences: &[Absence],
+    week_start: NaiveDate,
+) -> i64 {
     (0..7)
-        .map(|i| daily_target_minutes(goal_periods, week_start + Duration::days(i)))
+        .map(|i| daily_target_minutes(goal_periods, absences, week_start + Duration::days(i)))
         .sum()
 }
 
@@ -150,6 +184,7 @@ pub struct WeekRow {
 pub fn history_weeks(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> Vec<WeekRow> {
@@ -168,7 +203,7 @@ pub fn history_weeks(
             })
             .collect();
         let worked_week = day_totals.iter().map(|(_, m)| m).sum();
-        let goal_week = weekly_goal_minutes_for_week(goal_periods, week_start);
+        let goal_week = weekly_goal_minutes_for_week(goal_periods, absences, week_start);
         rows.push(WeekRow {
             week_start,
             day_totals,
@@ -183,22 +218,24 @@ pub fn history_weeks(
 pub fn minutes_left_today(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
     let worked = worked_minutes(&entries_on(entries, today), today, now);
-    (daily_target_minutes(goal_periods, today) - worked).max(0)
+    (daily_target_minutes(goal_periods, absences, today) - worked).max(0)
 }
 
 pub fn minutes_left_week(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
     let (week_start, _) = week_bounds(today);
     let worked = worked_minutes(&entries_in_week(entries, week_start), today, now);
-    (weekly_goal_minutes_for_week(goal_periods, week_start) - worked).max(0)
+    (weekly_goal_minutes_for_week(goal_periods, absences, week_start) - worked).max(0)
 }
 
 /// Signed version of the time debt: positive means behind (that many
@@ -219,6 +256,7 @@ pub fn minutes_left_week(
 fn time_balance_minutes(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
@@ -227,11 +265,11 @@ fn time_balance_minutes(
     let mut day = start;
     while day < today {
         let worked = worked_minutes(&entries_on(entries, day), today, now);
-        historical += daily_target_minutes(goal_periods, day) - worked;
+        historical += daily_target_minutes(goal_periods, absences, day) - worked;
         day += Duration::days(1);
     }
     let worked_today = worked_minutes(&entries_on(entries, today), today, now);
-    let surplus_today = (worked_today - daily_target_minutes(goal_periods, today)).max(0);
+    let surplus_today = (worked_today - daily_target_minutes(goal_periods, absences, today)).max(0);
     historical - surplus_today
 }
 
@@ -241,10 +279,11 @@ fn time_balance_minutes(
 pub fn time_debt_minutes(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
-    time_balance_minutes(entries, goal_periods, today, now).max(0)
+    time_balance_minutes(entries, goal_periods, absences, today, now).max(0)
 }
 
 /// Minutes worked beyond what's needed to clear all outstanding time debt -
@@ -255,10 +294,11 @@ pub fn time_debt_minutes(
 pub fn time_surplus_minutes(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     today: NaiveDate,
     now: NaiveTime,
 ) -> i64 {
-    (-time_balance_minutes(entries, goal_periods, today, now)).max(0)
+    (-time_balance_minutes(entries, goal_periods, absences, today, now)).max(0)
 }
 
 /// Gaps between consecutive logged entries for `day`, sorted by start time.
@@ -292,12 +332,13 @@ pub fn today_gaps(entries: &[TimeEntry], day: NaiveDate) -> Vec<(NaiveTime, Naiv
 pub fn leave_time(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     cfg: &Config,
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
-    let left_today = minutes_left_today(entries, goal_periods, today, now);
-    let surplus = time_surplus_minutes(entries, goal_periods, today, now);
+    let left_today = minutes_left_today(entries, goal_periods, absences, today, now);
+    let surplus = time_surplus_minutes(entries, goal_periods, absences, today, now);
     let minutes_owed = (left_today - surplus).max(0);
     leave_time_after(minutes_owed, entries, cfg, today, now)
 }
@@ -313,12 +354,13 @@ pub fn leave_time(
 pub fn leave_time_debt(
     entries: &[TimeEntry],
     goal_periods: &[GoalPeriod],
+    absences: &[Absence],
     cfg: &Config,
     today: NaiveDate,
     now: NaiveTime,
 ) -> NaiveTime {
-    let minutes_owed = minutes_left_today(entries, goal_periods, today, now)
-        + time_debt_minutes(entries, goal_periods, today, now);
+    let minutes_owed = minutes_left_today(entries, goal_periods, absences, today, now)
+        + time_debt_minutes(entries, goal_periods, absences, today, now);
     leave_time_after(minutes_owed, entries, cfg, today, now)
 }
 
@@ -411,6 +453,14 @@ mod tests {
         }]
     }
 
+    fn absence(id: u64, date: NaiveDate, reason: Option<&str>) -> Absence {
+        Absence {
+            id,
+            date,
+            reason: reason.map(String::from),
+        }
+    }
+
     #[test]
     fn worked_minutes_sums_entries() {
         let d = date(2026, 9, 11);
@@ -423,18 +473,18 @@ mod tests {
     fn daily_target_weekday_vs_weekend() {
         let g = goal_periods(40.0);
         // 2026-09-11 is a Friday
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 11)), 480);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 11)), 480);
         // 2026-09-12 is a Saturday
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 12)), 0);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 12)), 0);
         // 2026-09-13 is a Sunday
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 13)), 0);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 13)), 0);
     }
 
     #[test]
     fn daily_target_rounds_uneven_goal() {
         let g = goal_periods(37.5);
         // 37.5h * 60 = 2250 minutes / 5 = 450 minutes/day
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 11)), 450);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 11)), 450);
     }
 
     #[test]
@@ -442,7 +492,7 @@ mod tests {
         let g = goal_periods(40.0);
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "18:00")]; // 10h worked, target 8h
-        assert_eq!(minutes_left_today(&entries, &g, d, end_of_day()), 0);
+        assert_eq!(minutes_left_today(&entries, &g, &[], d, end_of_day()), 0);
     }
 
     #[test]
@@ -455,7 +505,7 @@ mod tests {
             entry(3, date(2026, 9, 14), "08:00", "16:00"), // next week, excluded
         ];
         assert_eq!(
-            minutes_left_week(&entries, &g, monday, end_of_day()),
+            minutes_left_week(&entries, &g, &[], monday, end_of_day()),
             40 * 60 - 16 * 60
         );
     }
@@ -465,7 +515,10 @@ mod tests {
         let g = goal_periods(10.0);
         let monday = date(2026, 9, 7);
         let entries = vec![entry(1, monday, "08:00", "18:00")]; // 10h worked, goal 10h
-        assert_eq!(minutes_left_week(&entries, &g, monday, end_of_day()), 0);
+        assert_eq!(
+            minutes_left_week(&entries, &g, &[], monday, end_of_day()),
+            0
+        );
     }
 
     #[test]
@@ -568,6 +621,88 @@ mod tests {
     }
 
     #[test]
+    fn is_absent_true_on_absent_day_false_otherwise() {
+        let a = vec![absence(1, date(2026, 10, 12), None)];
+        assert!(is_absent(&a, date(2026, 10, 12)));
+        assert!(!is_absent(&a, date(2026, 10, 13)));
+    }
+
+    #[test]
+    fn absence_on_finds_the_right_record() {
+        let a = vec![
+            absence(1, date(2026, 10, 12), Some("sick")),
+            absence(2, date(2026, 10, 20), None),
+        ];
+        assert_eq!(absence_on(&a, date(2026, 10, 12)).map(|r| r.id), Some(1));
+        assert_eq!(
+            absence_on(&a, date(2026, 10, 12)).and_then(|r| r.reason.as_deref()),
+            Some("sick")
+        );
+        assert!(absence_on(&a, date(2026, 10, 13)).is_none());
+    }
+
+    #[test]
+    fn absence_date_conflicts_detects_collision_and_excludes_given_id() {
+        let a = vec![
+            absence(1, date(2026, 10, 12), None),
+            absence(2, date(2026, 10, 20), None),
+        ];
+        assert!(absence_date_conflicts(&a, date(2026, 10, 12), None));
+        assert!(!absence_date_conflicts(&a, date(2026, 10, 12), Some(1)));
+        assert!(!absence_date_conflicts(&a, date(2026, 10, 13), None));
+    }
+
+    #[test]
+    fn daily_target_minutes_zero_on_an_absent_weekday() {
+        let g = goal_periods(40.0);
+        // 2026-10-12 is a Monday - would normally have a target.
+        let a = vec![absence(1, date(2026, 10, 12), None)];
+        assert_eq!(daily_target_minutes(&g, &a, date(2026, 10, 12)), 0);
+    }
+
+    #[test]
+    fn time_debt_minutes_does_not_accrue_deficit_for_an_absent_day() {
+        let g = goal_periods(40.0); // 8h/day target
+        let entries = vec![entry(1, date(2026, 9, 8), "08:00", "16:00")]; // Tue, on target
+        // Monday was absent - without the absence, it would accrue a full
+        // 8h (480min) deficit; with it, this day contributes nothing.
+        let a = vec![absence(1, date(2026, 9, 7), Some("sick"))];
+        let wednesday = date(2026, 9, 9);
+        assert_eq!(
+            time_debt_minutes(&entries, &g, &a, wednesday, end_of_day()),
+            0
+        );
+    }
+
+    #[test]
+    fn weekly_goal_minutes_for_week_excludes_an_absent_day() {
+        let g = goal_periods(40.0); // 8h/day
+        let monday = date(2026, 9, 7);
+        let a = vec![absence(1, monday, None)];
+        // Mon absent (0) + Tue-Fri at 8h each = 32h = 1920min.
+        assert_eq!(weekly_goal_minutes_for_week(&g, &a, monday), 1920);
+    }
+
+    #[test]
+    fn history_weeks_colors_an_absent_day_like_a_zero_target_day() {
+        // Confirms the "free win": once daily_target_minutes returns 0 for
+        // an absent day, history_weeks's goal_week already reflects it with
+        // no further changes needed - the day's coloring (a UI concern)
+        // then naturally treats it the same as a zero-target weekend.
+        let g = goal_periods(40.0);
+        let monday = date(2026, 9, 7);
+        let a = vec![absence(1, monday, None)];
+        let today = date(2026, 9, 9);
+        let rows = history_weeks(&[], &g, &a, today, end_of_day());
+        // Mon absent (0) + Tue (0, no entries logged) + ... but only Mon is
+        // relevant here: confirm its slot's target contribution is excluded
+        // from the week total by checking the week total against a
+        // no-absence baseline.
+        let rows_no_absence = history_weeks(&[], &g, &[], today, end_of_day());
+        assert_eq!(rows[0].goal_week, rows_no_absence[0].goal_week - 480);
+    }
+
+    #[test]
     fn daily_target_minutes_uses_goal_in_effect_for_that_day() {
         let g = vec![
             GoalPeriod {
@@ -582,9 +717,9 @@ mod tests {
             },
         ];
         // 2026-09-25 is a Friday, before the change.
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 25)), 480);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 25)), 480);
         // 2026-09-28 is a Monday, the change date itself.
-        assert_eq!(daily_target_minutes(&g, date(2026, 9, 28)), 360);
+        assert_eq!(daily_target_minutes(&g, &[], date(2026, 9, 28)), 360);
     }
 
     #[test]
@@ -610,7 +745,10 @@ mod tests {
         // If the new goal were wrongly applied retroactively to Friday too
         // (6h target instead of 8h), Friday's deficit would only be 0 -
         // this pins that it isn't.
-        assert_eq!(time_debt_minutes(&entries, &g, today, end_of_day()), 180);
+        assert_eq!(
+            time_debt_minutes(&entries, &g, &[], today, end_of_day()),
+            180
+        );
     }
 
     #[test]
@@ -629,7 +767,7 @@ mod tests {
         ];
         let monday = date(2026, 9, 7);
         // Mon, Tue, Wed at 8h + Thu, Fri at 6h = 24h + 12h = 36h = 2160min.
-        assert_eq!(weekly_goal_minutes_for_week(&g, monday), 2160);
+        assert_eq!(weekly_goal_minutes_for_week(&g, &[], monday), 2160);
     }
 
     #[test]
@@ -651,7 +789,7 @@ mod tests {
             entry(2, date(2026, 9, 28), "08:00", "16:00"), // week of the change
         ];
         let today = date(2026, 9, 29);
-        let rows = history_weeks(&entries, &g, today, end_of_day());
+        let rows = history_weeks(&entries, &g, &[], today, end_of_day());
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].week_start, date(2026, 9, 21));
         assert_eq!(rows[0].goal_week, 40 * 60);
@@ -663,7 +801,7 @@ mod tests {
     fn history_weeks_empty_with_no_entries_is_just_the_current_week() {
         let g = goal_periods(40.0);
         let today = date(2026, 9, 11); // Friday
-        let rows = history_weeks(&[], &g, today, end_of_day());
+        let rows = history_weeks(&[], &g, &[], today, end_of_day());
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].week_start, date(2026, 9, 7));
         assert_eq!(rows[0].worked_week, 0);
@@ -679,7 +817,7 @@ mod tests {
             entry(2, date(2026, 9, 9), "08:00", "12:00"),  // Wed, 1 week back
         ];
         let today = date(2026, 9, 11); // Friday, current week starts 9/7
-        let rows = history_weeks(&entries, &g, today, end_of_day());
+        let rows = history_weeks(&entries, &g, &[], today, end_of_day());
         assert_eq!(
             rows.iter().map(|r| r.week_start).collect::<Vec<_>>(),
             vec![date(2026, 8, 31), date(2026, 9, 7),]
@@ -694,7 +832,7 @@ mod tests {
     fn time_debt_zero_on_first_day_of_week() {
         let g = goal_periods(40.0);
         let monday = date(2026, 9, 7);
-        assert_eq!(time_debt_minutes(&[], &g, monday, end_of_day()), 0);
+        assert_eq!(time_debt_minutes(&[], &g, &[], monday, end_of_day()), 0);
     }
 
     #[test]
@@ -709,7 +847,7 @@ mod tests {
         let friday = date(2026, 9, 11);
         // Nothing worked yet today, so no surplus to offset the debt with.
         assert_eq!(
-            time_debt_minutes(&entries, &g, friday, end_of_day()),
+            time_debt_minutes(&entries, &g, &[], friday, end_of_day()),
             150 + 100 + 75 + 170
         );
     }
@@ -723,7 +861,7 @@ mod tests {
         ];
         let wednesday = date(2026, 9, 9);
         assert_eq!(
-            time_debt_minutes(&entries, &g, wednesday, end_of_day()),
+            time_debt_minutes(&entries, &g, &[], wednesday, end_of_day()),
             180
         );
     }
@@ -736,7 +874,10 @@ mod tests {
             entry(2, date(2026, 9, 8), "08:00", "14:40"), // Tue 6h40m, deficit 1h20m
         ];
         let wednesday = date(2026, 9, 9);
-        assert_eq!(time_debt_minutes(&entries, &g, wednesday, end_of_day()), 0);
+        assert_eq!(
+            time_debt_minutes(&entries, &g, &[], wednesday, end_of_day()),
+            0
+        );
     }
 
     #[test]
@@ -751,7 +892,7 @@ mod tests {
         ];
         let wednesday = date(2026, 9, 9);
         assert_eq!(
-            time_surplus_minutes(&entries, &g, wednesday, end_of_day()),
+            time_surplus_minutes(&entries, &g, &[], wednesday, end_of_day()),
             140
         );
     }
@@ -761,10 +902,10 @@ mod tests {
         let g = goal_periods(40.0);
         let entries = vec![entry(1, date(2026, 9, 7), "08:00", "13:00")]; // Mon 5h, deficit 3h
         let wednesday = date(2026, 9, 9);
-        let debt = time_debt_minutes(&entries, &g, wednesday, end_of_day());
+        let debt = time_debt_minutes(&entries, &g, &[], wednesday, end_of_day());
         assert!(debt > 0, "test needs outstanding debt to be meaningful");
         assert_eq!(
-            time_surplus_minutes(&entries, &g, wednesday, end_of_day()),
+            time_surplus_minutes(&entries, &g, &[], wednesday, end_of_day()),
             0
         );
     }
@@ -783,7 +924,7 @@ mod tests {
         // Sunday: the whole Mon-Sat week has elapsed; nothing logged Sunday itself.
         let sunday = date(2026, 9, 13);
         assert_eq!(
-            time_debt_minutes(&entries, &g, sunday, end_of_day()),
+            time_debt_minutes(&entries, &g, &[], sunday, end_of_day()),
             100 - 60
         );
     }
@@ -801,7 +942,7 @@ mod tests {
         let friday = date(2026, 9, 11);
         let now = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
         // Paid off mid-day, well before Friday is actually over.
-        assert_eq!(time_debt_minutes(&entries, &g, friday, now), 0);
+        assert_eq!(time_debt_minutes(&entries, &g, &[], friday, now), 0);
     }
 
     #[test]
@@ -816,7 +957,7 @@ mod tests {
         ];
         let friday = date(2026, 9, 11);
         let now = NaiveTime::parse_from_str("16:30", "%H:%M").unwrap();
-        assert_eq!(time_debt_minutes(&entries, &g, friday, now), 150 - 30);
+        assert_eq!(time_debt_minutes(&entries, &g, &[], friday, now), 150 - 30);
     }
 
     #[test]
@@ -832,11 +973,11 @@ mod tests {
         let friday = date(2026, 9, 11);
         // Only 6h worked so far - below today's own 8h target, no surplus yet.
         let now_early = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
-        assert_eq!(time_debt_minutes(&entries, &g, friday, now_early), 150);
+        assert_eq!(time_debt_minutes(&entries, &g, &[], friday, now_early), 150);
         // By 18:30, 10h30m elapsed - 2h30m surplus, exactly enough to clear
         // the debt, without ever calling `clockout end`.
         let now_later = NaiveTime::parse_from_str("18:30", "%H:%M").unwrap();
-        assert_eq!(time_debt_minutes(&entries, &g, friday, now_later), 0);
+        assert_eq!(time_debt_minutes(&entries, &g, &[], friday, now_later), 0);
     }
 
     #[test]
@@ -854,7 +995,7 @@ mod tests {
         // should still show.
         let monday_week2 = date(2026, 9, 7);
         assert_eq!(
-            time_debt_minutes(&entries, &g, monday_week2, end_of_day()),
+            time_debt_minutes(&entries, &g, &[], monday_week2, end_of_day()),
             180
         );
     }
@@ -874,7 +1015,7 @@ mod tests {
         // 180min carried over from week 1: debt is fully cleared.
         let tuesday_week2 = date(2026, 9, 8);
         assert_eq!(
-            time_debt_minutes(&entries, &g, tuesday_week2, end_of_day()),
+            time_debt_minutes(&entries, &g, &[], tuesday_week2, end_of_day()),
             0
         );
     }
@@ -915,7 +1056,7 @@ mod tests {
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00")]; // 4h worked, 4h left
         let now = NaiveTime::parse_from_str("12:00", "%H:%M").unwrap();
-        let leave = leave_time(&entries, &g, &c, d, now);
+        let leave = leave_time(&entries, &g, &[], &c, d, now);
         assert_eq!(leave, NaiveTime::parse_from_str("16:30", "%H:%M").unwrap());
     }
 
@@ -929,7 +1070,7 @@ mod tests {
             entry(2, d, "13:00", "15:00"), // 6h worked total, 2h left, real gap logged
         ];
         let now = NaiveTime::parse_from_str("15:00", "%H:%M").unwrap();
-        let leave = leave_time(&entries, &g, &c, d, now);
+        let leave = leave_time(&entries, &g, &[], &c, d, now);
         assert_eq!(leave, NaiveTime::parse_from_str("17:00", "%H:%M").unwrap());
     }
 
@@ -940,7 +1081,7 @@ mod tests {
         let d = date(2026, 9, 11);
         let entries = vec![entry(1, d, "08:00", "12:00")]; // 4h worked, 4h left
         let now = NaiveTime::parse_from_str("12:00", "%H:%M").unwrap();
-        let leave = leave_time(&entries, &g, &c, d, now);
+        let leave = leave_time(&entries, &g, &[], &c, d, now);
         assert_eq!(leave, NaiveTime::parse_from_str("16:00", "%H:%M").unwrap());
     }
 
@@ -960,7 +1101,7 @@ mod tests {
         let wednesday = date(2026, 9, 9);
         let now = NaiveTime::parse_from_str("14:00", "%H:%M").unwrap();
         assert_eq!(
-            leave_time_debt(&entries, &g, &c, wednesday, now),
+            leave_time_debt(&entries, &g, &[], &c, wednesday, now),
             NaiveTime::parse_from_str("01:00", "%H:%M").unwrap() // wraps past midnight
         );
     }
@@ -978,11 +1119,11 @@ mod tests {
         ];
         let tuesday = date(2026, 9, 8);
         let now = NaiveTime::parse_from_str("10:23", "%H:%M").unwrap();
-        let debt = time_debt_minutes(&entries, &g, tuesday, now);
+        let debt = time_debt_minutes(&entries, &g, &[], tuesday, now);
         assert!(debt > 0, "test needs a nonzero debt to be meaningful");
         assert_eq!(
-            leave_time_debt(&entries, &g, &c, tuesday, now),
-            leave_time(&entries, &g, &c, tuesday, now) + Duration::minutes(debt)
+            leave_time_debt(&entries, &g, &[], &c, tuesday, now),
+            leave_time(&entries, &g, &[], &c, tuesday, now) + Duration::minutes(debt)
         );
     }
 
@@ -995,7 +1136,7 @@ mod tests {
         // today's target is exactly met (0 left) and there's no debt.
         let entries = vec![entry(1, d, "08:00", "16:00")];
         let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
-        assert_eq!(leave_time_debt(&entries, &g, &c, d, now), now);
+        assert_eq!(leave_time_debt(&entries, &g, &[], &c, d, now), now);
     }
 
     #[test]
@@ -1010,13 +1151,13 @@ mod tests {
         let now = NaiveTime::parse_from_str("10:00", "%H:%M").unwrap();
         // left_today would be 6h (8h target - 2h worked), but the 4h
         // banked from Monday's surplus knocks that down to 2h.
-        let surplus = time_surplus_minutes(&entries, &g, tuesday, now);
+        let surplus = time_surplus_minutes(&entries, &g, &[], tuesday, now);
         assert_eq!(
             surplus, 240,
             "test needs a nonzero surplus to be meaningful"
         );
         assert_eq!(
-            leave_time(&entries, &g, &c, tuesday, now),
+            leave_time(&entries, &g, &[], &c, tuesday, now),
             NaiveTime::parse_from_str("12:00", "%H:%M").unwrap()
         );
     }
@@ -1033,12 +1174,12 @@ mod tests {
         // Nothing worked yet today (left_today = 8h), but Monday's 8h
         // surplus fully covers it - "leave at" floors at `now` rather than
         // going negative/into the past.
-        let surplus = time_surplus_minutes(&entries, &g, tuesday, now);
+        let surplus = time_surplus_minutes(&entries, &g, &[], tuesday, now);
         assert!(
             surplus >= 8 * 60,
             "test needs a surplus covering the whole 8h target"
         );
-        assert_eq!(leave_time(&entries, &g, &c, tuesday, now), now);
+        assert_eq!(leave_time(&entries, &g, &[], &c, tuesday, now), now);
     }
 
     #[test]
@@ -1050,7 +1191,7 @@ mod tests {
         // At 08:00, 0 worked, full 8h owed: leave at 16:00.
         let now1 = NaiveTime::parse_from_str("08:00", "%H:%M").unwrap();
         assert_eq!(
-            leave_time(&entries, &g, &c, d, now1),
+            leave_time(&entries, &g, &[], &c, d, now1),
             NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
         );
         // An hour later, still working (block still open): that hour's now
@@ -1058,7 +1199,7 @@ mod tests {
         // receding to 17:00.
         let now2 = NaiveTime::parse_from_str("09:00", "%H:%M").unwrap();
         assert_eq!(
-            leave_time(&entries, &g, &c, d, now2),
+            leave_time(&entries, &g, &[], &c, d, now2),
             NaiveTime::parse_from_str("16:00", "%H:%M").unwrap()
         );
     }
@@ -1143,7 +1284,7 @@ mod tests {
         // 4h25m of the second block counts, not just up to now.
         let now = NaiveTime::parse_from_str("16:00", "%H:%M").unwrap();
         // worked: 3h20m + 4h25m = 7h45m; target 8h -> 15m left.
-        let leave = leave_time(&entries, &g, &c, d, now);
+        let leave = leave_time(&entries, &g, &[], &c, d, now);
         assert_eq!(leave, NaiveTime::parse_from_str("16:15", "%H:%M").unwrap());
     }
 

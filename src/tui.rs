@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use chrono::{Datelike, Local, NaiveDate, NaiveTime, Weekday};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::{Frame, Terminal};
 
 use crate::calc;
-use crate::model::{Config, GoalPeriod, TimeEntry};
+use crate::model::{Absence, Config, GoalPeriod, TimeEntry};
 use crate::parse;
 use crate::storage;
 
@@ -44,13 +44,14 @@ enum Mode {
     ConfirmDelete(DeleteTarget),
 }
 
-/// What a confirmed delete removes - entries and goal periods are deleted
-/// through the same `y`/`n` confirm prompt, so this says which list (and
-/// which id in it) to act on.
+/// What a confirmed delete removes - entries, goal periods, and absences
+/// are all deleted through the same `y`/`n` confirm prompt, so this says
+/// which list (and which id in it) to act on.
 #[derive(Clone, Copy)]
 enum DeleteTarget {
     Entry(u64),
     GoalPeriod(u64),
+    Absence(u64),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -68,6 +69,11 @@ enum ModalKind {
     End,
     /// Two-field form (date, hours) for adding/editing a goal period.
     GoalPeriod,
+    /// Two-field form (date, reason) for adding/editing an absence - reached
+    /// from the Add popup with Alt+a (see `App::toggle_add_mode`), reusing
+    /// `date_buf`/`start_buf` (the latter repurposed as the reason field)
+    /// rather than growing `ModalState` with absence-specific buffers.
+    Absence,
 }
 
 struct ModalState {
@@ -80,7 +86,7 @@ struct ModalState {
     time_buf: String,
     /// The hours field used by the GoalPeriod modal.
     hours_buf: String,
-    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End; 0=date, 1=hours for GoalPeriod
+    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End; 0=date, 1=hours for GoalPeriod; 0=date, 1=reason for Absence
     /// True while the focused field's existing text hasn't been touched yet:
     /// it renders as selected, and the next keystroke overwrites it instead
     /// of appending (like a browser text input). Reset on every focus
@@ -96,6 +102,15 @@ enum Pane {
     Entries,
 }
 
+/// One selectable row in the focused day's entries panel: either a logged
+/// time entry or the day's absence (at most one of the latter, shown first
+/// - see `App::visible`). e/d act on whichever is selected.
+#[derive(Clone)]
+enum DaySelectable {
+    Absence(Absence),
+    Entry(TimeEntry),
+}
+
 /// Which top-level view is showing. Dashboard/History are toggled with
 /// 'h'; Goals is reached via the Dashboard's "other" submenu ('o', then
 /// 'g' - see `App::other_menu_open`) rather than its own top-level key.
@@ -109,6 +124,7 @@ enum Screen {
 struct App {
     entries: Vec<TimeEntry>,
     goal_periods: Vec<GoalPeriod>,
+    absences: Vec<Absence>,
     config: Config,
     /// The day whose entries show in the entries panel and whose row is
     /// marked in the week diagram. Defaults to today; moved with j/k while
@@ -142,6 +158,7 @@ impl App {
         let mut app = App {
             entries: data.entries,
             goal_periods: data.goal_periods,
+            absences: data.absences,
             config,
             focused_day: Local::now().date_naive(),
             focus_pane: Pane::Entries,
@@ -176,6 +193,7 @@ impl App {
         let data = storage::load_entries()?;
         self.entries = data.entries;
         self.goal_periods = data.goal_periods;
+        self.absences = data.absences;
         self.config = storage::load_config()?;
         let len = self.visible().len();
         if len == 0 {
@@ -222,10 +240,17 @@ impl App {
         Local::now().date_naive()
     }
 
-    /// The focused day's entries, sorted by start time.
-    fn visible(&self) -> Vec<&TimeEntry> {
-        let mut v = calc::entries_on(&self.entries, self.focused_day);
-        v.sort_by_key(|e| e.start);
+    /// The focused day's selectable rows: its absence (if any, always
+    /// first - a day has at most one) followed by its entries sorted by
+    /// start time.
+    fn visible(&self) -> Vec<DaySelectable> {
+        let mut v = Vec::new();
+        if let Some(a) = calc::absence_on(&self.absences, self.focused_day) {
+            v.push(DaySelectable::Absence(a.clone()));
+        }
+        let mut entries = calc::entries_on(&self.entries, self.focused_day);
+        entries.sort_by_key(|e| e.start);
+        v.extend(entries.into_iter().cloned().map(DaySelectable::Entry));
         v
     }
 
@@ -245,8 +270,8 @@ impl App {
         self.days_in_week(week_start)
     }
 
-    fn selected_entry(&self) -> Option<TimeEntry> {
-        self.visible().get(self.selected).map(|e| (*e).clone())
+    fn selected_item(&self) -> Option<DaySelectable> {
+        self.visible().into_iter().nth(self.selected)
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -293,25 +318,81 @@ impl App {
     }
 
     fn open_edit(&mut self) {
-        if let Some(e) = self.selected_entry() {
-            // An in-progress entry already has its start filled in - jump
-            // straight to the blank end field instead of the start field.
-            let focus = if e.end.is_none() { 2 } else { 1 };
-            self.mode = Mode::Modal(ModalState {
-                kind: ModalKind::AddEdit,
-                editing_id: Some(e.id),
-                date_buf: e.date.to_string(),
-                start_buf: e.start.format("%H:%M").to_string(),
-                end_buf: e
-                    .end
-                    .map(|t| t.format("%H:%M").to_string())
-                    .unwrap_or_default(),
-                time_buf: String::new(),
-                hours_buf: String::new(),
-                focus,
-                field_selected: true,
-                error: None,
-            });
+        match self.selected_item() {
+            Some(DaySelectable::Entry(e)) => {
+                // An in-progress entry already has its start filled in -
+                // jump straight to the blank end field instead of the
+                // start field.
+                let focus = if e.end.is_none() { 2 } else { 1 };
+                self.mode = Mode::Modal(ModalState {
+                    kind: ModalKind::AddEdit,
+                    editing_id: Some(e.id),
+                    date_buf: e.date.to_string(),
+                    start_buf: e.start.format("%H:%M").to_string(),
+                    end_buf: e
+                        .end
+                        .map(|t| t.format("%H:%M").to_string())
+                        .unwrap_or_default(),
+                    time_buf: String::new(),
+                    hours_buf: String::new(),
+                    focus,
+                    field_selected: true,
+                    error: None,
+                });
+            }
+            Some(DaySelectable::Absence(a)) => self.open_absence_edit(&a),
+            None => {}
+        }
+    }
+
+    /// Open the add-absence modal, prefilled with the focused day and a
+    /// blank reason.
+    fn open_absence_add(&mut self) {
+        self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::Absence,
+            editing_id: None,
+            date_buf: self.focused_day.to_string(),
+            start_buf: String::new(),
+            end_buf: String::new(),
+            time_buf: String::new(),
+            hours_buf: String::new(),
+            focus: 0,
+            field_selected: true,
+            error: None,
+        });
+    }
+
+    fn open_absence_edit(&mut self, a: &Absence) {
+        self.mode = Mode::Modal(ModalState {
+            kind: ModalKind::Absence,
+            editing_id: Some(a.id),
+            date_buf: a.date.to_string(),
+            start_buf: a.reason.clone().unwrap_or_default(),
+            end_buf: String::new(),
+            time_buf: String::new(),
+            hours_buf: String::new(),
+            focus: 0,
+            field_selected: true,
+            error: None,
+        });
+    }
+
+    /// While adding (not editing - converting an existing record between
+    /// kinds isn't supported), flips the Add popup between a normal time
+    /// entry and an absence (Alt+a). Resets the modal fresh for the other
+    /// kind rather than merging field text across kinds, since `start_buf`
+    /// means different things in each (start time vs. reason).
+    fn toggle_add_mode(&mut self) {
+        let Mode::Modal(m) = &self.mode else {
+            return;
+        };
+        if m.editing_id.is_some() {
+            return;
+        }
+        match m.kind {
+            ModalKind::AddEdit => self.open_absence_add(),
+            ModalKind::Absence => self.open_add(),
+            _ => {}
         }
     }
 
@@ -415,6 +496,7 @@ impl App {
             ModalKind::AddEdit => self.submit_add_edit(),
             ModalKind::End => self.submit_end(),
             ModalKind::GoalPeriod => self.submit_goal_period(),
+            ModalKind::Absence => self.submit_absence(),
         }
     }
 
@@ -482,6 +564,12 @@ impl App {
         };
 
         let result = storage::with_entries(|data| {
+            if calc::is_absent(&data.absences, candidate.date) {
+                anyhow::bail!(
+                    "{} is marked absent - delete the absence first",
+                    candidate.date
+                );
+            }
             if let Some(conflict) = data.entries.iter().find(|e| {
                 e.date == candidate.date
                     && Some(e.id) != editing_id
@@ -574,12 +662,24 @@ impl App {
         let today = self.today();
         let worked_today =
             calc::worked_minutes(&calc::entries_on(&self.entries, today), today, now);
-        let target_today = calc::daily_target_minutes(&self.goal_periods, today);
-        let debt = calc::time_debt_minutes(&self.entries, &self.goal_periods, today, now);
+        let target_today = calc::daily_target_minutes(&self.goal_periods, &self.absences, today);
+        let debt = calc::time_debt_minutes(
+            &self.entries,
+            &self.goal_periods,
+            &self.absences,
+            today,
+            now,
+        );
         let tail = if debt > 0 {
             format!(", time debt {}", calc::format_hm(debt))
         } else {
-            let surplus = calc::time_surplus_minutes(&self.entries, &self.goal_periods, today, now);
+            let surplus = calc::time_surplus_minutes(
+                &self.entries,
+                &self.goal_periods,
+                &self.absences,
+                today,
+                now,
+            );
             if surplus > 0 {
                 format!(", -{} debt", calc::format_hm(surplus))
             } else {
@@ -587,10 +687,14 @@ impl App {
             }
         };
         let summary = if target_today == 0 {
-            format!(
-                "clocked out - logged {} (no target today)",
-                calc::format_hm(worked_today)
-            )
+            if calc::is_absent(&self.absences, today) {
+                "clocked out - absent today".to_string()
+            } else {
+                format!(
+                    "clocked out - logged {} (no target today)",
+                    calc::format_hm(worked_today)
+                )
+            }
         } else {
             format!(
                 "clocked out - {} / {} today{tail}",
@@ -664,6 +768,72 @@ impl App {
         Ok(())
     }
 
+    /// Submits the absence modal: parses the date (same relative/ISO
+    /// fallback chain as `submit_add_edit`), takes the reason field as-is
+    /// (blank -> `None`), rejects a duplicate date
+    /// (`calc::absence_date_conflicts`) or one that already has logged
+    /// entries, then either updates the absence being edited or appends a
+    /// new one.
+    fn submit_absence(&mut self) -> Result<()> {
+        let Mode::Modal(m) = &self.mode else {
+            return Ok(());
+        };
+
+        let date = parse::resolve_day_spec(&m.date_buf, self.today()).or_else(|_| {
+            NaiveDate::parse_from_str(&m.date_buf, "%Y-%m-%d")
+                .map_err(|_| format!("invalid date '{}', expected YYYY-MM-DD", m.date_buf))
+        });
+        let date = match date {
+            Ok(d) => d,
+            Err(e) => {
+                self.set_modal_error(e);
+                return Ok(());
+            }
+        };
+
+        let reason = m.start_buf.trim();
+        let reason = if reason.is_empty() {
+            None
+        } else {
+            Some(reason.to_string())
+        };
+
+        let editing_id = m.editing_id;
+        let result = storage::with_entries(|data| {
+            if calc::absence_date_conflicts(&data.absences, date, editing_id) {
+                anyhow::bail!("{date} is already marked absent");
+            }
+            if !calc::entries_on(&data.entries, date).is_empty() {
+                anyhow::bail!("{date} already has logged entries");
+            }
+            if let Some(id) = editing_id {
+                if let Some(existing) = data.absences.iter_mut().find(|a| a.id == id) {
+                    existing.date = date;
+                    existing.reason = reason.clone();
+                }
+            } else {
+                let id = data.next_id;
+                data.next_id += 1;
+                data.absences.push(Absence {
+                    id,
+                    date,
+                    reason: reason.clone(),
+                });
+            }
+            Ok(data.absences.clone())
+        });
+
+        match result {
+            Ok(absences) => {
+                self.absences = absences;
+                self.mode = Mode::Normal;
+                self.set_status(StatusKind::Info, "saved");
+            }
+            Err(e) => self.set_modal_error(e.to_string()),
+        }
+        Ok(())
+    }
+
     fn set_modal_error(&mut self, err: String) {
         if let Mode::Modal(m) = &mut self.mode {
             m.error = Some(err);
@@ -671,8 +841,14 @@ impl App {
     }
 
     fn request_delete(&mut self) {
-        if let Some(e) = self.selected_entry() {
-            self.mode = Mode::ConfirmDelete(DeleteTarget::Entry(e.id));
+        match self.selected_item() {
+            Some(DaySelectable::Entry(e)) => {
+                self.mode = Mode::ConfirmDelete(DeleteTarget::Entry(e.id));
+            }
+            Some(DaySelectable::Absence(a)) => {
+                self.mode = Mode::ConfirmDelete(DeleteTarget::Absence(a.id));
+            }
+            None => {}
         }
     }
 
@@ -710,6 +886,15 @@ impl App {
                     Err(e) => self.set_status(StatusKind::Error, e.to_string()),
                 }
             }
+            DeleteTarget::Absence(id) => {
+                let absences = storage::with_entries(|data| {
+                    data.absences.retain(|a| a.id != id);
+                    Ok(data.absences.clone())
+                })?;
+                self.absences = absences;
+                self.mode = Mode::Normal;
+                self.set_status(StatusKind::Info, format!("deleted absence #{id}"));
+            }
         }
         Ok(())
     }
@@ -719,6 +904,7 @@ impl App {
         calc::history_weeks(
             &self.entries,
             &self.goal_periods,
+            &self.absences,
             self.today(),
             Local::now().time(),
         )
@@ -809,7 +995,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                handle_key(&mut app, key.code)?;
+                handle_key(&mut app, key.code, key.modifiers)?;
             }
         } else {
             app.reload()?;
@@ -818,7 +1004,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     Ok(())
 }
 
-fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
+fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<()> {
     match &mut app.mode {
         Mode::Normal => match app.screen {
             Screen::Dashboard if app.other_menu_open => match code {
@@ -891,10 +1077,14 @@ fn handle_key(app: &mut App, code: KeyCode) -> Result<()> {
                 ModalKind::AddEdit => 3,
                 ModalKind::End => 1,
                 ModalKind::GoalPeriod => 2,
+                ModalKind::Absence => 2,
             };
             match code {
                 KeyCode::Esc => app.mode = Mode::Normal,
                 KeyCode::Enter => app.submit_modal()?,
+                KeyCode::Char('a') if modifiers.contains(KeyModifiers::ALT) => {
+                    app.toggle_add_mode();
+                }
                 KeyCode::Tab | KeyCode::Down => {
                     m.focus = (m.focus + 1) % field_count;
                     m.field_selected = true;
@@ -939,6 +1129,10 @@ fn current_buf(m: &mut ModalState) -> &mut String {
             0 => &mut m.date_buf,
             _ => &mut m.hours_buf,
         },
+        ModalKind::Absence => match m.focus {
+            0 => &mut m.date_buf,
+            _ => &mut m.start_buf,
+        },
     }
 }
 
@@ -958,8 +1152,20 @@ fn draw(f: &mut Frame, app: &App) {
 
 fn draw_dashboard(f: &mut Frame, app: &App) {
     let now = Local::now().time();
-    let debt = calc::time_debt_minutes(&app.entries, &app.goal_periods, app.today(), now);
-    let surplus = calc::time_surplus_minutes(&app.entries, &app.goal_periods, app.today(), now);
+    let debt = calc::time_debt_minutes(
+        &app.entries,
+        &app.goal_periods,
+        &app.absences,
+        app.today(),
+        now,
+    );
+    let surplus = calc::time_surplus_minutes(
+        &app.entries,
+        &app.goal_periods,
+        &app.absences,
+        app.today(),
+        now,
+    );
     let stats_height = if debt > 0 || surplus > 0 { 5 } else { 4 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -982,19 +1188,31 @@ fn draw_dashboard(f: &mut Frame, app: &App) {
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     let today = app.today();
     let now = Local::now().time();
-    let target_today = calc::daily_target_minutes(&app.goal_periods, today);
+    let target_today = calc::daily_target_minutes(&app.goal_periods, &app.absences, today);
     let spans = if target_today == 0 {
-        let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
-        vec![
-            Span::styled(
-                "No target today — logged ",
+        if let Some(absence) = calc::absence_on(&app.absences, today) {
+            let tail = absence
+                .reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            vec![Span::styled(
+                format!("Absent today{tail}"),
                 Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                calc::format_hm(worked),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-        ]
+            )]
+        } else {
+            let worked = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
+            vec![
+                Span::styled(
+                    "No target today — logged ",
+                    Style::default().fg(LABEL).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    calc::format_hm(worked),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ]
+        }
     } else if let Some(clocked_out) = calc::clocked_out_at(&app.entries, today) {
         vec![
             Span::styled(
@@ -1007,7 +1225,14 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             ),
         ]
     } else {
-        let leave = calc::leave_time(&app.entries, &app.goal_periods, &app.config, today, now);
+        let leave = calc::leave_time(
+            &app.entries,
+            &app.goal_periods,
+            &app.absences,
+            &app.config,
+            today,
+            now,
+        );
         vec![
             Span::styled(
                 "Leave at ",
@@ -1030,16 +1255,25 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64, surplus: i64) {
     let today = app.today();
     let now = Local::now().time();
     let worked_today = calc::worked_minutes(&calc::entries_on(&app.entries, today), today, now);
-    let target_today = calc::daily_target_minutes(&app.goal_periods, today);
-    let left_today = calc::minutes_left_today(&app.entries, &app.goal_periods, today, now);
+    let target_today = calc::daily_target_minutes(&app.goal_periods, &app.absences, today);
+    let left_today =
+        calc::minutes_left_today(&app.entries, &app.goal_periods, &app.absences, today, now);
 
     let (week_start, _) = calc::week_bounds(today);
     let worked_week =
         calc::worked_minutes(&calc::entries_in_week(&app.entries, week_start), today, now);
-    let goal_week = calc::weekly_goal_minutes_for_week(&app.goal_periods, week_start);
-    let left_week = calc::minutes_left_week(&app.entries, &app.goal_periods, today, now);
-    let clear_debt_by =
-        calc::leave_time_debt(&app.entries, &app.goal_periods, &app.config, today, now);
+    let goal_week =
+        calc::weekly_goal_minutes_for_week(&app.goal_periods, &app.absences, week_start);
+    let left_week =
+        calc::minutes_left_week(&app.entries, &app.goal_periods, &app.absences, today, now);
+    let clear_debt_by = calc::leave_time_debt(
+        &app.entries,
+        &app.goal_periods,
+        &app.absences,
+        &app.config,
+        today,
+        now,
+    );
 
     let label = Style::default().fg(LABEL);
     let value = Style::default().add_modifier(Modifier::BOLD);
@@ -1128,19 +1362,38 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
         DayItem::Gap(start, _) => *start,
     });
 
-    // app.selected indexes app.visible() (entries only, sorted the same
-    // way); track which row of the combined, gap-interleaved list that
-    // lands on so the highlight stays on the right entry.
+    // app.selected indexes app.visible() (the day's absence, if any, then
+    // its entries - see DaySelectable); track which row of this combined,
+    // gap-interleaved list that lands on so the highlight stays on the
+    // right one.
     let mut items: Vec<ListItem> = Vec::new();
     let mut select_index = None;
-    let mut entry_count = 0;
+    let mut selectable_count = 0;
+    if let Some(a) = calc::absence_on(&app.absences, day) {
+        if selectable_count == app.selected {
+            select_index = Some(items.len());
+        }
+        selectable_count += 1;
+        let tail = a
+            .reason
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        items.push(ListItem::new(Span::styled(
+            format!("Absent{tail}"),
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
     for item in &combined {
         match item {
             DayItem::Entry(e) => {
-                if entry_count == app.selected {
+                if selectable_count == app.selected {
                     select_index = Some(items.len());
                 }
-                entry_count += 1;
+                selectable_count += 1;
                 let range_style = if e.end.is_none() {
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
                 } else {
@@ -1174,7 +1427,7 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
         // Highlight the placeholder itself, so it's clear this pane (not
         // the week diagram) has focus even when there's nothing to select.
         state.select(Some(0));
-    } else if entry_count > 0 {
+    } else if selectable_count > 0 {
         state.select(select_index);
     }
 
@@ -1209,24 +1462,25 @@ fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'s
         .map(|day| {
             let day_entries = calc::entries_on(&app.entries, day);
             let total = calc::worked_minutes(&day_entries, today, now);
+            let absent = calc::is_absent(&app.absences, day);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
             let bar_width = inner_width.saturating_sub(prefix.chars().count() as u16);
             let cells = day_bar(
                 &day_entries,
-                window_start,
-                window_end,
+                (window_start, window_end),
                 bar_width as usize,
                 day,
                 today,
                 now,
+                absent,
             );
 
             // Mark the focused row on its prefix only - inverting the whole
             // line would make the bar's own colors hard to read. Dimmed
             // (bold only, no reverse) while the Entries pane has focus
             // instead of this one, so it's clear j/k won't move this row
-            // right now. A future, unfocused day is grayed out - it hasn't
-            // happened yet, so there's nothing to show there.
+            // right now. A future, unfocused day (or one marked absent) is
+            // grayed out - there's nothing worked to show there.
             let prefix_style = if day == app.focused_day {
                 let base = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
                 if app.focus_pane == Pane::Days {
@@ -1234,7 +1488,7 @@ fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'s
                 } else {
                     base
                 }
-            } else if day > today {
+            } else if day > today || absent {
                 Style::default().fg(MUTED)
             } else {
                 Style::default().fg(LABEL)
@@ -1288,6 +1542,10 @@ enum Cell {
     /// One of the last few columns of an open block's elapsed span. The
     /// index selects a glyph from `FADE` (higher = closer to now/fainter).
     Open(usize),
+    /// The whole day is marked absent - fills the bar instead of showing
+    /// empty dots, so it reads as "blocked off" rather than "nothing
+    /// logged yet".
+    Absent,
 }
 
 /// Rasterizes a day's entries across `width` columns spanning
@@ -1299,15 +1557,19 @@ enum Cell {
 /// rather than definitively closed.
 fn day_bar(
     entries: &[&TimeEntry],
-    window_start: NaiveTime,
-    window_end: NaiveTime,
+    window: (NaiveTime, NaiveTime),
     width: usize,
     day: NaiveDate,
     today: NaiveDate,
     now: NaiveTime,
+    absent: bool,
 ) -> Vec<Cell> {
+    let (window_start, window_end) = window;
     if width == 0 {
         return Vec::new();
+    }
+    if absent {
+        return vec![Cell::Absent; width];
     }
     let total_minutes = (window_end - window_start).num_minutes().max(1);
     let col_time = |c: usize| {
@@ -1377,6 +1639,7 @@ fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
             Cell::Worked => ('█', Style::default().fg(ACCENT)),
             Cell::Open(stage) => (FADE[stage], Style::default().fg(ACCENT)),
             Cell::Empty => ('·', Style::default().fg(MUTED)),
+            Cell::Absent => ('▒', Style::default().fg(MUTED)),
         };
         spans.push(Span::styled(ch.to_string().repeat(j - i), style));
         i = j;
@@ -1384,7 +1647,31 @@ fn bar_spans(cells: &[Cell]) -> Vec<Span<'static>> {
     spans
 }
 
+/// The footer's hint line while a modal is open - replaces the screen's
+/// normal hints with ones relevant to the popup, since the popup itself no
+/// longer renders its own (too narrow to fit them all legibly).
+fn modal_footer_hints(m: &ModalState) -> Vec<(&'static str, &'static str)> {
+    let mut hints = Vec::new();
+    if m.kind != ModalKind::End {
+        hints.push(("Tab", "next field"));
+    }
+    hints.push(("Enter", "save"));
+    hints.push(("Esc", "cancel"));
+    // Converting an existing record between kinds isn't supported - see
+    // `App::toggle_add_mode` - so the toggle is only offered while adding.
+    match m.kind {
+        ModalKind::AddEdit if m.editing_id.is_none() => hints.push(("Alt+a", "add absence")),
+        ModalKind::Absence if m.editing_id.is_none() => hints.push(("Alt+a", "back to entry")),
+        _ => {}
+    }
+    hints
+}
+
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    if let Mode::Modal(m) = &app.mode {
+        f.render_widget(Paragraph::new(hint_line(&modal_footer_hints(m))), area);
+        return;
+    }
     let p = match &app.status {
         Some((kind, s, _)) => {
             let color = if *kind == StatusKind::Error {
@@ -1476,11 +1763,12 @@ fn draw_modal(f: &mut Frame, m: &ModalState) {
         ModalKind::AddEdit => draw_add_edit_modal(f, m),
         ModalKind::End => draw_time_modal(f, m, " Finish block ", "End time"),
         ModalKind::GoalPeriod => draw_goal_period_modal(f, m),
+        ModalKind::Absence => draw_absence_modal(f, m),
     }
 }
 
 fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
-    let area = centered_rect(50, 9, f.area());
+    let area = centered_rect(50, 6, f.area());
     f.render_widget(Clear, area);
 
     let title = if m.editing_id.is_some() {
@@ -1495,7 +1783,6 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -1539,17 +1826,10 @@ fn draw_add_edit_modal(f: &mut Frame, m: &ModalState) {
             chunks[3],
         );
     }
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "Tab: next field | Enter: save | Esc: cancel",
-            Style::default().fg(MUTED),
-        )),
-        chunks[4],
-    );
 }
 
 fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
-    let area = centered_rect(46, 7, f.area());
+    let area = centered_rect(46, 4, f.area());
     f.render_widget(Clear, area);
 
     let block = gray_block(title.to_string());
@@ -1558,11 +1838,7 @@ fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
 
     f.render_widget(
@@ -1578,17 +1854,10 @@ fn draw_time_modal(f: &mut Frame, m: &ModalState, title: &str, label: &str) {
             chunks[1],
         );
     }
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "Enter: save | Esc: cancel",
-            Style::default().fg(MUTED),
-        )),
-        chunks[2],
-    );
 }
 
 fn draw_goal_period_modal(f: &mut Frame, m: &ModalState) {
-    let area = centered_rect(46, 8, f.area());
+    let area = centered_rect(46, 5, f.area());
     f.render_widget(Clear, area);
 
     let title = if m.editing_id.is_some() {
@@ -1603,7 +1872,6 @@ fn draw_goal_period_modal(f: &mut Frame, m: &ModalState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
@@ -1637,13 +1905,57 @@ fn draw_goal_period_modal(f: &mut Frame, m: &ModalState) {
             chunks[2],
         );
     }
+}
+
+fn draw_absence_modal(f: &mut Frame, m: &ModalState) {
+    let area = centered_rect(46, 5, f.area());
+    f.render_widget(Clear, area);
+
+    let title = if m.editing_id.is_some() {
+        " Edit absence "
+    } else {
+        " Add absence "
+    };
+    let block = gray_block(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
     f.render_widget(
-        Paragraph::new(Span::styled(
-            "Tab: next field | Enter: save | Esc: cancel",
-            Style::default().fg(MUTED),
+        Paragraph::new(field_line(
+            "Date",
+            &m.date_buf,
+            m.focus == 0,
+            m.field_selected,
         )),
-        chunks[3],
+        chunks[0],
     );
+    f.render_widget(
+        Paragraph::new(field_line(
+            "Reason",
+            &m.start_buf,
+            m.focus == 1,
+            m.field_selected,
+        )),
+        chunks[1],
+    );
+    if let Some(err) = &m.error {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                err.as_str(),
+                Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
+            )),
+            chunks[2],
+        );
+    }
 }
 
 fn draw_confirm(f: &mut Frame, target: DeleteTarget) {
@@ -1656,6 +1968,7 @@ fn draw_confirm(f: &mut Frame, target: DeleteTarget) {
     let (label, id) = match target {
         DeleteTarget::Entry(id) => ("Delete entry ", id),
         DeleteTarget::GoalPeriod(id) => ("Delete goal period ", id),
+        DeleteTarget::Absence(id) => ("Delete absence ", id),
     };
     let p = Paragraph::new(Line::from(vec![
         Span::raw(label),
@@ -1675,7 +1988,7 @@ const DAY_LABELS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
 fn draw_history_screen(f: &mut Frame, app: &App) {
     let today = app.today();
     let now = Local::now().time();
-    let mut rows = calc::history_weeks(&app.entries, &app.goal_periods, today, now);
+    let mut rows = calc::history_weeks(&app.entries, &app.goal_periods, &app.absences, today, now);
     rows.reverse(); // newest first
 
     let chunks = Layout::default()
@@ -1748,7 +2061,7 @@ fn draw_history(f: &mut Frame, app: &App, area: Rect, rows: &[calc::WeekRow]) {
             let mut spans = vec![Span::styled(label, label_style)];
             for &i in &day_indices {
                 let (day, worked) = row.day_totals[i];
-                let target = calc::daily_target_minutes(&app.goal_periods, day);
+                let target = calc::daily_target_minutes(&app.goal_periods, &app.absences, day);
                 let color = history_cell_color(day, today, worked, target);
                 let text = if day > today {
                     "-".to_string()
@@ -1844,7 +2157,7 @@ fn draw_goals_screen(f: &mut Frame, app: &App) {
         .split(f.area());
 
     draw_goals(f, app, chunks[0]);
-    draw_goals_footer(f, chunks[1]);
+    draw_goals_footer(f, app, chunks[1]);
 }
 
 /// A selectable list of every goal period, oldest first (reads as a
@@ -1922,7 +2235,11 @@ fn draw_goals(f: &mut Frame, app: &App, area: Rect) {
     f.render_stateful_widget(list, inner_chunks[1], &mut state);
 }
 
-fn draw_goals_footer(f: &mut Frame, area: Rect) {
+fn draw_goals_footer(f: &mut Frame, app: &App, area: Rect) {
+    if let Mode::Modal(m) = &app.mode {
+        f.render_widget(Paragraph::new(hint_line(&modal_footer_hints(m))), area);
+        return;
+    }
     let p = Paragraph::new(hint_line(&[
         ("q", "quit"),
         ("a", "add"),
