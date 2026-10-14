@@ -69,10 +69,13 @@ enum ModalKind {
     End,
     /// Two-field form (date, hours) for adding/editing a goal period.
     GoalPeriod,
-    /// Two-field form (date, reason) for adding/editing an absence - reached
-    /// from the Add popup with Alt+a (see `App::toggle_add_mode`), reusing
-    /// `date_buf`/`start_buf` (the latter repurposed as the reason field)
-    /// rather than growing `ModalState` with absence-specific buffers.
+    /// Form for adding/editing an absence - reached from the Add popup with
+    /// Alt+a (see `App::toggle_add_mode`). Whole-day by default (date,
+    /// reason); Alt+t (see `App::toggle_absence_interval`) flips it to a
+    /// time interval (date, start, end, reason) for a partial-day absence.
+    /// Reuses `date_buf`/`start_buf`/`end_buf`/`hours_buf` (the last
+    /// repurposed as the reason field) rather than growing `ModalState`
+    /// with absence-specific buffers.
     Absence,
 }
 
@@ -84,9 +87,13 @@ struct ModalState {
     end_buf: String,
     /// The single time field used by the End modal.
     time_buf: String,
-    /// The hours field used by the GoalPeriod modal.
+    /// The hours field used by the GoalPeriod modal; repurposed as the
+    /// reason field for the Absence modal.
     hours_buf: String,
-    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End; 0=date, 1=hours for GoalPeriod; 0=date, 1=reason for Absence
+    /// True while the Absence modal is in time-interval mode rather than
+    /// whole-day - see `ModalKind::Absence`. Meaningless for other kinds.
+    absence_interval: bool,
+    focus: usize, // 0=date, 1=start, 2=end for AddEdit; always 0 for End; 0=date, 1=hours for GoalPeriod; Absence: 0=date, 1=reason (whole-day) or 0=date, 1=start, 2=end, 3=reason (interval)
     /// True while the focused field's existing text hasn't been touched yet:
     /// it renders as selected, and the next keystroke overwrites it instead
     /// of appending (like a browser text input). Reset on every focus
@@ -311,6 +318,7 @@ impl App {
             end_buf: String::new(),
             time_buf: String::new(),
             hours_buf: String::new(),
+            absence_interval: false,
             focus: 1,
             field_selected: true,
             error: None,
@@ -335,6 +343,7 @@ impl App {
                         .unwrap_or_default(),
                     time_buf: String::new(),
                     hours_buf: String::new(),
+                    absence_interval: false,
                     focus,
                     field_selected: true,
                     error: None,
@@ -345,8 +354,8 @@ impl App {
         }
     }
 
-    /// Open the add-absence modal, prefilled with the focused day and a
-    /// blank reason.
+    /// Open the add-absence modal, prefilled with the focused day, a blank
+    /// reason, and whole-day mode (toggle to an interval with Alt+t).
     fn open_absence_add(&mut self) {
         self.mode = Mode::Modal(ModalState {
             kind: ModalKind::Absence,
@@ -356,6 +365,7 @@ impl App {
             end_buf: String::new(),
             time_buf: String::new(),
             hours_buf: String::new(),
+            absence_interval: false,
             focus: 0,
             field_selected: true,
             error: None,
@@ -367,14 +377,41 @@ impl App {
             kind: ModalKind::Absence,
             editing_id: Some(a.id),
             date_buf: a.date.to_string(),
-            start_buf: a.reason.clone().unwrap_or_default(),
-            end_buf: String::new(),
+            start_buf: a
+                .start
+                .map(|t| t.format("%H:%M").to_string())
+                .unwrap_or_default(),
+            end_buf: a
+                .end
+                .map(|t| t.format("%H:%M").to_string())
+                .unwrap_or_default(),
             time_buf: String::new(),
-            hours_buf: String::new(),
+            hours_buf: a.reason.clone().unwrap_or_default(),
+            absence_interval: a.start.is_some() && a.end.is_some(),
             focus: 0,
             field_selected: true,
             error: None,
         });
+    }
+
+    /// Flips the Absence modal between whole-day and a time interval
+    /// (Alt+t) - unlike `toggle_add_mode`, available while editing too,
+    /// since this just adjusts fields on the same record rather than
+    /// converting between record kinds.
+    fn toggle_absence_interval(&mut self) {
+        let Mode::Modal(m) = &mut self.mode else {
+            return;
+        };
+        if m.kind != ModalKind::Absence {
+            return;
+        }
+        m.absence_interval = !m.absence_interval;
+        if m.absence_interval && m.start_buf.trim().is_empty() {
+            m.start_buf = Local::now().time().format("%H:%M").to_string();
+        }
+        m.focus = 0;
+        m.field_selected = true;
+        m.error = None;
     }
 
     /// While adding (not editing - converting an existing record between
@@ -414,6 +451,7 @@ impl App {
             end_buf: String::new(),
             time_buf: Local::now().time().format("%H:%M").to_string(),
             hours_buf: String::new(),
+            absence_interval: false,
             focus: 0,
             field_selected: true,
             error: None,
@@ -464,6 +502,7 @@ impl App {
             end_buf: String::new(),
             time_buf: String::new(),
             hours_buf: String::new(),
+            absence_interval: false,
             focus: 0,
             field_selected: true,
             error: None,
@@ -480,6 +519,7 @@ impl App {
                 end_buf: String::new(),
                 time_buf: String::new(),
                 hours_buf: p.weekly_goal_hours.to_string(),
+                absence_interval: false,
                 focus: 0,
                 field_selected: true,
                 error: None,
@@ -564,9 +604,12 @@ impl App {
         };
 
         let result = storage::with_entries(|data| {
-            if calc::is_absent(&data.absences, candidate.date) {
+            let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+            if let Some(a) = calc::absence_on(&data.absences, candidate.date)
+                && calc::absence_blocks(a, candidate.start, candidate.end.unwrap_or(end_of_day))
+            {
                 anyhow::bail!(
-                    "{} is marked absent - delete the absence first",
+                    "{} overlaps an absence - delete or adjust it first",
                     candidate.date
                 );
             }
@@ -791,7 +834,35 @@ impl App {
             }
         };
 
-        let reason = m.start_buf.trim();
+        let (start, end) = if m.absence_interval {
+            if m.start_buf.trim().is_empty() || m.end_buf.trim().is_empty() {
+                self.set_modal_error("start and end time are required".to_string());
+                return Ok(());
+            }
+            let start = match parse::parse_time(&m.start_buf) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_modal_error(e);
+                    return Ok(());
+                }
+            };
+            let end = match parse::parse_time(&m.end_buf) {
+                Ok(t) => t,
+                Err(e) => {
+                    self.set_modal_error(e);
+                    return Ok(());
+                }
+            };
+            if start >= end {
+                self.set_modal_error("start must be before end".to_string());
+                return Ok(());
+            }
+            (Some(start), Some(end))
+        } else {
+            (None, None)
+        };
+
+        let reason = m.hours_buf.trim();
         let reason = if reason.is_empty() {
             None
         } else {
@@ -803,22 +874,31 @@ impl App {
             if calc::absence_date_conflicts(&data.absences, date, editing_id) {
                 anyhow::bail!("{date} is already marked absent");
             }
-            if !calc::entries_on(&data.entries, date).is_empty() {
-                anyhow::bail!("{date} already has logged entries");
+            let candidate = Absence {
+                id: editing_id.unwrap_or(0),
+                date,
+                start,
+                end,
+                reason: reason.clone(),
+            };
+            let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+            if calc::entries_on(&data.entries, date)
+                .iter()
+                .any(|e| calc::absence_blocks(&candidate, e.start, e.end.unwrap_or(end_of_day)))
+            {
+                anyhow::bail!("{date} already has logged entries in that range");
             }
             if let Some(id) = editing_id {
                 if let Some(existing) = data.absences.iter_mut().find(|a| a.id == id) {
                     existing.date = date;
+                    existing.start = start;
+                    existing.end = end;
                     existing.reason = reason.clone();
                 }
             } else {
                 let id = data.next_id;
                 data.next_id += 1;
-                data.absences.push(Absence {
-                    id,
-                    date,
-                    reason: reason.clone(),
-                });
+                data.absences.push(Absence { id, ..candidate });
             }
             Ok(data.absences.clone())
         });
@@ -1077,6 +1157,7 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
                 ModalKind::AddEdit => 3,
                 ModalKind::End => 1,
                 ModalKind::GoalPeriod => 2,
+                ModalKind::Absence if m.absence_interval => 4,
                 ModalKind::Absence => 2,
             };
             match code {
@@ -1084,6 +1165,11 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
                 KeyCode::Enter => app.submit_modal()?,
                 KeyCode::Char('a') if modifiers.contains(KeyModifiers::ALT) => {
                     app.toggle_add_mode();
+                }
+                KeyCode::Char('t')
+                    if modifiers.contains(KeyModifiers::ALT) && m.kind == ModalKind::Absence =>
+                {
+                    app.toggle_absence_interval();
                 }
                 KeyCode::Tab | KeyCode::Down => {
                     m.focus = (m.focus + 1) % field_count;
@@ -1129,9 +1215,15 @@ fn current_buf(m: &mut ModalState) -> &mut String {
             0 => &mut m.date_buf,
             _ => &mut m.hours_buf,
         },
+        ModalKind::Absence if m.absence_interval => match m.focus {
+            0 => &mut m.date_buf,
+            1 => &mut m.start_buf,
+            2 => &mut m.end_buf,
+            _ => &mut m.hours_buf,
+        },
         ModalKind::Absence => match m.focus {
             0 => &mut m.date_buf,
-            _ => &mut m.start_buf,
+            _ => &mut m.hours_buf,
         },
     }
 }
@@ -1166,7 +1258,12 @@ fn draw_dashboard(f: &mut Frame, app: &App) {
         app.today(),
         now,
     );
-    let stats_height = if debt > 0 || surplus > 0 { 5 } else { 4 };
+    // A partial (time-interval) absence today gets its own stats line -
+    // a whole-day one doesn't need it, already covered by the header's
+    // "Absent today" message and the Today line's zeroed target.
+    let partial_absence_today = calc::absence_on(&app.absences, app.today())
+        .is_some_and(|a| a.start.is_some() && a.end.is_some());
+    let stats_height = 4 + u16::from(debt > 0 || surplus > 0) + u16::from(partial_absence_today);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1301,6 +1398,22 @@ fn draw_stats(f: &mut Frame, app: &App, area: Rect, debt: i64, surplus: i64) {
         ),
         stat_line("This week: ", worked_week, "goal", goal_week, left_week),
     ];
+    if let Some(a) = calc::absence_on(&app.absences, today)
+        && let (Some(s), Some(e)) = (a.start, a.end)
+    {
+        let tail = a
+            .reason
+            .as_deref()
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled("Absent:    ", label),
+            Span::styled(
+                format!("{}-{}{tail}", s.format("%H:%M"), e.format("%H:%M")),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
     if debt > 0 {
         lines.push(Line::from(vec![
             Span::styled("Time debt: ", label),
@@ -1374,13 +1487,17 @@ fn draw_day_entries(f: &mut Frame, app: &App, area: Rect) {
             select_index = Some(items.len());
         }
         selectable_count += 1;
+        let range = match (a.start, a.end) {
+            (Some(s), Some(e)) => format!(" {}-{}", s.format("%H:%M"), e.format("%H:%M")),
+            _ => String::new(),
+        };
         let tail = a
             .reason
             .as_deref()
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
         items.push(ListItem::new(Span::styled(
-            format!("Absent{tail}"),
+            format!("Absent{range}{tail}"),
             Style::default()
                 .fg(ACCENT)
                 .add_modifier(Modifier::BOLD)
@@ -1462,7 +1579,7 @@ fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'s
         .map(|day| {
             let day_entries = calc::entries_on(&app.entries, day);
             let total = calc::worked_minutes(&day_entries, today, now);
-            let absent = calc::is_absent(&app.absences, day);
+            let absence = calc::absence_on(&app.absences, day);
             let prefix = format!("{:<9} {:>7}  ", day.format("%A"), calc::format_hm(total));
             let bar_width = inner_width.saturating_sub(prefix.chars().count() as u16);
             let cells = day_bar(
@@ -1472,15 +1589,15 @@ fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'s
                 day,
                 today,
                 now,
-                absent,
+                absence,
             );
 
             // Mark the focused row on its prefix only - inverting the whole
             // line would make the bar's own colors hard to read. Dimmed
             // (bold only, no reverse) while the Entries pane has focus
             // instead of this one, so it's clear j/k won't move this row
-            // right now. A future, unfocused day (or one marked absent) is
-            // grayed out - there's nothing worked to show there.
+            // right now. A future, unfocused day (or one with a recorded
+            // absence) is grayed out.
             let prefix_style = if day == app.focused_day {
                 let base = Style::default().fg(LABEL).add_modifier(Modifier::BOLD);
                 if app.focus_pane == Pane::Days {
@@ -1488,7 +1605,7 @@ fn week_lines(app: &App, week_start: NaiveDate, inner_width: u16) -> Vec<Line<'s
                 } else {
                     base
                 }
-            } else if day > today || absent {
+            } else if day > today || absence.is_some() {
                 Style::default().fg(MUTED)
             } else {
                 Style::default().fg(LABEL)
@@ -1562,13 +1679,14 @@ fn day_bar(
     day: NaiveDate,
     today: NaiveDate,
     now: NaiveTime,
-    absent: bool,
+    absence: Option<&Absence>,
 ) -> Vec<Cell> {
     let (window_start, window_end) = window;
     if width == 0 {
         return Vec::new();
     }
-    if absent {
+    // A whole-day absence fills the bar entirely - no per-column work to do.
+    if absence.is_some_and(|a| a.start.is_none() && a.end.is_none()) {
         return vec![Cell::Absent; width];
     }
     let total_minutes = (window_end - window_start).num_minutes().max(1);
@@ -1597,10 +1715,18 @@ fn day_bar(
         open.zip(open_end)
             .is_some_and(|(o, oe)| o.start < col_end && col_start < oe)
     };
+    // A partial absence (e.g. a doctor's appointment) blocks just its own
+    // interval's columns rather than the whole bar.
+    let is_absent_col = |c: usize| {
+        let (col_start, col_end) = col_range(c);
+        absence.is_some_and(|a| calc::absence_blocks(a, col_start, col_end))
+    };
 
     let mut cells: Vec<Cell> = (0..width)
         .map(|c| {
-            if is_closed_worked(c) || is_open_worked(c) {
+            if is_absent_col(c) {
+                Cell::Absent
+            } else if is_closed_worked(c) || is_open_worked(c) {
                 Cell::Worked
             } else {
                 Cell::Empty
@@ -1658,11 +1784,21 @@ fn modal_footer_hints(m: &ModalState) -> Vec<(&'static str, &'static str)> {
     hints.push(("Enter", "save"));
     hints.push(("Esc", "cancel"));
     // Converting an existing record between kinds isn't supported - see
-    // `App::toggle_add_mode` - so the toggle is only offered while adding.
+    // `App::toggle_add_mode` - so the Alt+a toggle is only offered while
+    // adding. Alt+t (whole-day vs. a time interval) is a same-record field
+    // toggle, so it's offered while editing too.
     match m.kind {
         ModalKind::AddEdit if m.editing_id.is_none() => hints.push(("Alt+a", "add absence")),
         ModalKind::Absence if m.editing_id.is_none() => hints.push(("Alt+a", "back to entry")),
         _ => {}
+    }
+    if m.kind == ModalKind::Absence {
+        let label = if m.absence_interval {
+            "whole day"
+        } else {
+            "time interval"
+        };
+        hints.push(("Alt+t", label));
     }
     hints
 }
@@ -1908,7 +2044,8 @@ fn draw_goal_period_modal(f: &mut Frame, m: &ModalState) {
 }
 
 fn draw_absence_modal(f: &mut Frame, m: &ModalState) {
-    let area = centered_rect(46, 5, f.area());
+    let field_count: u16 = if m.absence_interval { 4 } else { 2 };
+    let area = centered_rect(46, field_count + 3, f.area());
     f.render_widget(Clear, area);
 
     let title = if m.editing_id.is_some() {
@@ -1920,13 +2057,11 @@ fn draw_absence_modal(f: &mut Frame, m: &ModalState) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    let mut constraints = vec![Constraint::Length(1); field_count as usize];
+    constraints.push(Constraint::Min(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(1),
-        ])
+        .constraints(constraints)
         .split(inner);
 
     f.render_widget(
@@ -1938,14 +2073,37 @@ fn draw_absence_modal(f: &mut Frame, m: &ModalState) {
         )),
         chunks[0],
     );
+    let reason_chunk = if m.absence_interval {
+        f.render_widget(
+            Paragraph::new(field_line(
+                "Start",
+                &m.start_buf,
+                m.focus == 1,
+                m.field_selected,
+            )),
+            chunks[1],
+        );
+        f.render_widget(
+            Paragraph::new(field_line(
+                "End",
+                &m.end_buf,
+                m.focus == 2,
+                m.field_selected,
+            )),
+            chunks[2],
+        );
+        3
+    } else {
+        1
+    };
     f.render_widget(
         Paragraph::new(field_line(
             "Reason",
-            &m.start_buf,
-            m.focus == 1,
+            &m.hours_buf,
+            m.focus == field_count as usize - 1,
             m.field_selected,
         )),
-        chunks[1],
+        chunks[reason_chunk],
     );
     if let Some(err) = &m.error {
         f.render_widget(
@@ -1953,7 +2111,7 @@ fn draw_absence_modal(f: &mut Frame, m: &ModalState) {
                 err.as_str(),
                 Style::default().fg(DANGER).add_modifier(Modifier::BOLD),
             )),
-            chunks[2],
+            chunks[field_count as usize],
         );
     }
 }

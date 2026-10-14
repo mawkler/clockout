@@ -62,19 +62,26 @@ fn goal_hours_for(goal_periods: &[GoalPeriod], day: NaiveDate) -> f64 {
         .unwrap_or(40.0)
 }
 
-/// True if `day` has a recorded absence.
+/// True if `day` has a *whole-day* absence (no time interval) - used where
+/// an absence should block the entire day: the "Absent today" header, the
+/// week diagram's solid bar, rejecting any time logged that day. A
+/// partial-interval absence doesn't trigger this - only the specific
+/// interval it covers is blocked, see `absence_blocks`.
 pub fn is_absent(absences: &[Absence], day: NaiveDate) -> bool {
-    absences.iter().any(|a| a.date == day)
+    absences
+        .iter()
+        .any(|a| a.date == day && a.start.is_none() && a.end.is_none())
 }
 
-/// The absence recorded for `day`, if any.
+/// The absence recorded for `day`, if any (whole-day or a partial interval).
 pub fn absence_on(absences: &[Absence], day: NaiveDate) -> Option<&Absence> {
     absences.iter().find(|a| a.date == day)
 }
 
 /// True if `candidate_date` already has a recorded absence (excluding
 /// `excluding_id`, so editing one in place doesn't trip over itself).
-/// Mirrors `goal_period_date_conflicts`.
+/// Mirrors `goal_period_date_conflicts`. Only one absence record is
+/// allowed per date, whole-day or partial.
 pub fn absence_date_conflicts(
     absences: &[Absence],
     candidate_date: NaiveDate,
@@ -85,19 +92,35 @@ pub fn absence_date_conflicts(
         .any(|a| Some(a.id) != excluding_id && a.date == candidate_date)
 }
 
+/// True if `[start, end)` overlaps the time `absence` blocks: its own
+/// interval if it has one, or the whole day if it doesn't. Adjacency
+/// doesn't count as overlap, mirroring `overlaps`.
+pub fn absence_blocks(absence: &Absence, start: NaiveTime, end: NaiveTime) -> bool {
+    match (absence.start, absence.end) {
+        (Some(a_start), Some(a_end)) => a_start < end && start < a_end,
+        _ => true,
+    }
+}
+
 pub fn daily_target_minutes(
     goal_periods: &[GoalPeriod],
     absences: &[Absence],
     day: NaiveDate,
 ) -> i64 {
-    if is_absent(absences, day) {
-        return 0;
-    }
     match day.weekday() {
         Weekday::Sat | Weekday::Sun => 0,
         _ => {
             let goal_minutes = (goal_hours_for(goal_periods, day) * 60.0).round() as i64;
-            (goal_minutes as f64 / 5.0).round() as i64
+            let target = (goal_minutes as f64 / 5.0).round() as i64;
+            match absence_on(absences, day) {
+                Some(Absence {
+                    start: Some(s),
+                    end: Some(e),
+                    ..
+                }) => (target - (*e - *s).num_minutes()).max(0),
+                Some(_) => 0,
+                None => target,
+            }
         }
     }
 }
@@ -457,6 +480,24 @@ mod tests {
         Absence {
             id,
             date,
+            start: None,
+            end: None,
+            reason: reason.map(String::from),
+        }
+    }
+
+    fn absence_interval(
+        id: u64,
+        date: NaiveDate,
+        start: &str,
+        end: &str,
+        reason: Option<&str>,
+    ) -> Absence {
+        Absence {
+            id,
+            date,
+            start: Some(NaiveTime::parse_from_str(start, "%H:%M").unwrap()),
+            end: Some(NaiveTime::parse_from_str(end, "%H:%M").unwrap()),
             reason: reason.map(String::from),
         }
     }
@@ -628,6 +669,39 @@ mod tests {
     }
 
     #[test]
+    fn is_absent_false_for_a_partial_interval_absence() {
+        // is_absent means "the whole day is blocked" - a time-interval
+        // absence doesn't qualify, even though absence_on still finds it.
+        let a = vec![absence_interval(
+            1,
+            date(2026, 10, 12),
+            "10:00",
+            "12:00",
+            None,
+        )];
+        assert!(!is_absent(&a, date(2026, 10, 12)));
+        assert!(absence_on(&a, date(2026, 10, 12)).is_some());
+    }
+
+    #[test]
+    fn absence_blocks_whole_day_blocks_any_range() {
+        let a = absence(1, date(2026, 10, 12), None);
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert!(absence_blocks(&a, t("00:00"), t("23:59")));
+        assert!(absence_blocks(&a, t("10:00"), t("12:00")));
+    }
+
+    #[test]
+    fn absence_blocks_interval_only_blocks_overlapping_ranges() {
+        let a = absence_interval(1, date(2026, 10, 12), "10:00", "12:00", None);
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert!(absence_blocks(&a, t("09:00"), t("10:30"))); // overlaps start
+        assert!(absence_blocks(&a, t("11:30"), t("13:00"))); // overlaps end
+        assert!(!absence_blocks(&a, t("08:00"), t("10:00"))); // adjacent, before
+        assert!(!absence_blocks(&a, t("12:00"), t("14:00"))); // adjacent, after
+    }
+
+    #[test]
     fn absence_on_finds_the_right_record() {
         let a = vec![
             absence(1, date(2026, 10, 12), Some("sick")),
@@ -657,6 +731,35 @@ mod tests {
         let g = goal_periods(40.0);
         // 2026-10-12 is a Monday - would normally have a target.
         let a = vec![absence(1, date(2026, 10, 12), None)];
+        assert_eq!(daily_target_minutes(&g, &a, date(2026, 10, 12)), 0);
+    }
+
+    #[test]
+    fn daily_target_minutes_reduced_by_a_partial_absence() {
+        let g = goal_periods(40.0); // 8h/day = 480min
+        // 2026-10-12 is a Monday; a 2h appointment reduces the target to 6h.
+        let a = vec![absence_interval(
+            1,
+            date(2026, 10, 12),
+            "10:00",
+            "12:00",
+            None,
+        )];
+        assert_eq!(daily_target_minutes(&g, &a, date(2026, 10, 12)), 480 - 120);
+    }
+
+    #[test]
+    fn daily_target_minutes_partial_absence_floors_at_zero() {
+        let g = goal_periods(40.0); // 8h/day = 480min
+        // A longer interval than the target itself still floors at 0,
+        // rather than going negative.
+        let a = vec![absence_interval(
+            1,
+            date(2026, 10, 12),
+            "06:00",
+            "20:00",
+            None,
+        )];
         assert_eq!(daily_target_minutes(&g, &a, date(2026, 10, 12)), 0);
     }
 

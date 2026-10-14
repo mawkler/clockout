@@ -27,14 +27,28 @@ pub struct GoalPeriod {
     pub weekly_goal_hours: f64,
 }
 
-/// A single day you were absent (sick, vacation, etc.) and so don't owe a
-/// target for, even on a weekday. Doesn't touch `entries` at all - purely
-/// zeroes that day's contribution in `calc::daily_target_minutes`. See
-/// `calc::is_absent`.
+/// A day (or part of one) you were absent (sick, vacation, etc.) and so
+/// don't owe a target for. If `start`/`end` are set, only that time range
+/// on `date` is absent (e.g. a doctor's appointment) and the day's target
+/// is reduced by that duration instead of zeroed - see
+/// `calc::daily_target_minutes`/`calc::absence_blocks`. Both `None` means
+/// the whole day is absent, which is also the default when adding one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Absence {
     pub id: u64,
     pub date: NaiveDate,
+    #[serde(
+        with = "hhmm_time_opt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub start: Option<NaiveTime>,
+    #[serde(
+        with = "hhmm_time_opt",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub end: Option<NaiveTime>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
 }

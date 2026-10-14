@@ -1,10 +1,61 @@
+use std::io::IsTerminal;
+
 use chrono::{Datelike, Local, NaiveDate, NaiveTime};
 use clap::{Parser, Subcommand};
+use crossterm::style::{Color, Stylize};
 
 use crate::calc;
 use crate::model::{Absence, GoalPeriod, TimeEntry};
 use crate::parse;
 use crate::storage;
+
+const ACCENT: Color = Color::Cyan;
+const DANGER: Color = Color::Red;
+const SUCCESS: Color = Color::Green;
+const MUTED: Color = Color::DarkGrey;
+
+/// Minimal ANSI coloring for `clockout status`, mirroring the TUI's
+/// palette (accent/danger/success) so the two feel consistent. Skipped
+/// entirely when stdout isn't a terminal (e.g. piped to a file or into
+/// `grep`), so redirected output stays plain text.
+struct Paint {
+    enabled: bool,
+}
+
+impl Paint {
+    fn new() -> Self {
+        Paint {
+            enabled: std::io::stdout().is_terminal(),
+        }
+    }
+
+    fn color(&self, s: impl Into<String>, color: Color) -> String {
+        let s = s.into();
+        if self.enabled {
+            s.with(color).bold().to_string()
+        } else {
+            s
+        }
+    }
+
+    fn bold(&self, s: impl Into<String>) -> String {
+        let s = s.into();
+        if self.enabled {
+            s.bold().to_string()
+        } else {
+            s
+        }
+    }
+
+    fn muted(&self, s: impl Into<String>) -> String {
+        let s = s.into();
+        if self.enabled {
+            s.with(MUTED).to_string()
+        } else {
+            s
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(
@@ -175,8 +226,10 @@ fn cmd_log(
                 open.start.format("%H:%M")
             );
         }
-        if calc::is_absent(&data.absences, entry_date) {
-            anyhow::bail!("{entry_date} is marked absent - delete the absence first");
+        if let Some(a) = calc::absence_on(&data.absences, entry_date)
+            && calc::absence_blocks(a, start, end)
+        {
+            anyhow::bail!("{entry_date} overlaps an absence - delete or adjust it first");
         }
         let candidate = TimeEntry {
             id: data.next_id,
@@ -233,8 +286,11 @@ fn cmd_start(
                 open.start.format("%H:%M")
             );
         }
-        if calc::is_absent(&data.absences, entry_date) {
-            anyhow::bail!("{entry_date} is marked absent - delete the absence first");
+        let end_of_day = NaiveTime::from_hms_opt(23, 59, 59).unwrap();
+        if let Some(a) = calc::absence_on(&data.absences, entry_date)
+            && calc::absence_blocks(a, start, end_of_day)
+        {
+            anyhow::bail!("{entry_date} overlaps an absence - delete or adjust it first");
         }
         let candidate = TimeEntry {
             id: data.next_id,
@@ -356,6 +412,7 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
     let cfg = storage::load_config()?;
     let data = storage::load_entries()?;
     let now = Local::now().time();
+    let paint = Paint::new();
 
     let worked_today = calc::worked_minutes(&calc::entries_on(&data.entries, today), today, now);
     let target_today = calc::daily_target_minutes(&data.goal_periods, &data.absences, today);
@@ -383,7 +440,10 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         now,
     );
 
-    println!("{} ({})", today, today.format("%A"));
+    println!(
+        "{}",
+        paint.bold(format!("{} ({})", today, today.format("%A")))
+    );
     if target_today == 0 {
         if let Some(absence) = calc::absence_on(&data.absences, today) {
             let tail = absence
@@ -391,19 +451,44 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
                 .as_deref()
                 .map(|r| format!(" ({r})"))
                 .unwrap_or_default();
-            println!("Absent today{tail}");
+            println!("{}", paint.bold(format!("Absent today{tail}")));
         } else {
-            println!("No target today — logged {}", calc::format_hm(worked_today));
+            println!(
+                "No target today — logged {}",
+                paint.bold(calc::format_hm(worked_today))
+            );
         }
     } else {
+        let left_color = if left_today == 0 { SUCCESS } else { ACCENT };
         println!(
             "Today:     {} / {} target ({} left)",
-            calc::format_hm(worked_today),
+            paint.bold(calc::format_hm(worked_today)),
             calc::format_hm(target_today),
-            calc::format_hm(left_today)
+            paint.color(calc::format_hm(left_today), left_color)
         );
+        // Any absence reaching this branch must be a partial one - a
+        // whole-day absence always zeroes target_today, handled above.
+        if let Some(a) = calc::absence_on(&data.absences, today)
+            && let (Some(s), Some(e)) = (a.start, a.end)
+        {
+            let tail = a
+                .reason
+                .as_deref()
+                .map(|r| format!(" ({r})"))
+                .unwrap_or_default();
+            println!(
+                "Absent:    {}",
+                paint.color(
+                    format!("{}-{}{tail}", s.format("%H:%M"), e.format("%H:%M")),
+                    ACCENT
+                )
+            );
+        }
         if let Some(clocked_out) = calc::clocked_out_at(&data.entries, today) {
-            println!("Clocked out: {}", clocked_out.format("%H:%M"));
+            println!(
+                "Clocked out: {}",
+                paint.color(clocked_out.format("%H:%M").to_string(), SUCCESS)
+            );
         } else {
             let leave = calc::leave_time(
                 &data.entries,
@@ -413,14 +498,18 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
                 today,
                 now,
             );
-            println!("Leave at:  {}", leave.format("%H:%M"));
+            println!(
+                "Leave at:  {}",
+                paint.color(leave.format("%H:%M").to_string(), ACCENT)
+            );
         }
     }
+    let week_left_color = if left_week == 0 { SUCCESS } else { ACCENT };
     println!(
         "This week: {} / {} goal ({} left)",
-        calc::format_hm(worked_week),
+        paint.bold(calc::format_hm(worked_week)),
         calc::format_hm(goal_week),
-        calc::format_hm(left_week)
+        paint.color(calc::format_hm(left_week), week_left_color)
     );
     let debt = calc::time_debt_minutes(
         &data.entries,
@@ -440,8 +529,8 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
         );
         println!(
             "Time debt: {} · clear by {}",
-            calc::format_hm(debt),
-            clear_debt_by.format("%H:%M")
+            paint.color(calc::format_hm(debt), DANGER),
+            paint.color(clear_debt_by.format("%H:%M").to_string(), ACCENT)
         );
     } else {
         let surplus = calc::time_surplus_minutes(
@@ -452,14 +541,18 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
             now,
         );
         if surplus > 0 {
-            println!("Time debt: -{}", calc::format_hm(surplus));
+            println!(
+                "Time debt: {}",
+                paint.color(format!("-{}", calc::format_hm(surplus)), SUCCESS)
+            );
         }
     }
     if let Some(open) = calc::open_entry(&data.entries) {
         println!(
-            "Open block: {} started {} (`clockout end` to close)",
+            "Open block: {} started {} {}",
             open.date,
-            open.start.format("%H:%M")
+            paint.color(open.start.format("%H:%M").to_string(), ACCENT),
+            paint.muted("(`clockout end` to close)")
         );
     }
     Ok(())
@@ -735,6 +828,8 @@ fn cmd_absence_add(
         let absence = Absence {
             id: data.next_id,
             date: absence_date,
+            start: None,
+            end: None,
             reason,
         };
         data.next_id += 1;
@@ -759,12 +854,16 @@ fn cmd_absence_list() -> anyhow::Result<()> {
         return Ok(());
     }
     for a in absences {
+        let range = match (a.start, a.end) {
+            (Some(s), Some(e)) => format!(" {}-{}", s.format("%H:%M"), e.format("%H:%M")),
+            _ => String::new(),
+        };
         let tail = a
             .reason
             .as_deref()
             .map(|r| format!(" ({r})"))
             .unwrap_or_default();
-        println!("#{:<4} {}{tail}", a.id, a.date);
+        println!("#{:<4} {}{range}{tail}", a.id, a.date);
     }
     Ok(())
 }

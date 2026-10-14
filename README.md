@@ -40,7 +40,8 @@ Options:
 In the TUI, press `h` to toggle the history view, or `o` then `g` to manage
 goal periods. To mark a day absent instead of logging time for it, open the
 add popup (`a`) and press Alt+a to flip it into absence mode (date +
-optional reason).
+optional reason) - whole-day by default, or press Alt+t to fill in a time
+interval instead (e.g. a couple of hours for an appointment).
 
 ## Build
 
@@ -64,7 +65,9 @@ goal.
 
 Absences (sick days, vacation, etc.) also live in `entries.json`, managed
 with `clockout absence ...` or the TUI's add popup (Alt+a). A day marked
-absent owes nothing toward the goal and doesn't accrue time debt.
+absent owes nothing toward the goal and doesn't accrue time debt; the TUI
+also supports a partial-day absence (a time interval), which reduces that
+day's target by the interval's duration instead of zeroing it.
 
 ## LLM disclosure
 
