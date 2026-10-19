@@ -1,4 +1,4 @@
-use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Weekday};
+use chrono::{Datelike, Duration, NaiveDate, NaiveTime, Timelike, Weekday};
 
 use crate::model::{Absence, Config, GoalPeriod, TimeEntry};
 
@@ -413,6 +413,21 @@ pub fn overlaps(a: &TimeEntry, b: &TimeEntry) -> bool {
     a.start < b_end && b.start < a_end
 }
 
+/// Rounds `time` to the nearest multiple of `minutes` (half rounds up),
+/// wrapping around midnight - e.g. with `minutes` 5, 12:58 -> 13:00 and
+/// 23:59 -> 00:00. `minutes` 0 or 1 is a no-op (nothing to round to).
+/// Used to round a suggested time (e.g. "now") before showing it in a
+/// form, per `Config::round_to_minutes` - never applied to a stored time.
+pub fn round_to_nearest_minutes(time: NaiveTime, minutes: u32) -> NaiveTime {
+    if minutes <= 1 {
+        return time;
+    }
+    let minutes = minutes as i64;
+    let total = (time.hour() * 60 + time.minute()) as i64;
+    let rounded = ((total + minutes / 2) / minutes * minutes).rem_euclid(24 * 60);
+    NaiveTime::from_hms_opt((rounded / 60) as u32, (rounded % 60) as u32, 0).unwrap()
+}
+
 /// Formats a minute count as "Xh" when there are no leftover minutes, or
 /// "XhYYm" otherwise, e.g. 240 -> "4h", 270 -> "4h30m", 30 -> "30m".
 pub fn format_hm(minutes: i64) -> String {
@@ -465,6 +480,7 @@ mod tests {
         Config {
             estimated_lunch_break_minutes: lunch_break,
             hide_weekends: false,
+            round_to_minutes: 1,
         }
     }
 
@@ -1150,6 +1166,27 @@ mod tests {
         assert_eq!(format_hm(30), "30m");
         assert_eq!(format_hm(0), "0h");
         assert_eq!(format_hm(-90), "-1h30m");
+    }
+
+    #[test]
+    fn round_to_nearest_minutes_rounds_up_and_down() {
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert_eq!(round_to_nearest_minutes(t("12:58"), 5), t("13:00"));
+        assert_eq!(round_to_nearest_minutes(t("12:52"), 5), t("12:50"));
+        assert_eq!(round_to_nearest_minutes(t("12:50"), 5), t("12:50"));
+    }
+
+    #[test]
+    fn round_to_nearest_minutes_wraps_past_midnight() {
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert_eq!(round_to_nearest_minutes(t("23:59"), 5), t("00:00"));
+    }
+
+    #[test]
+    fn round_to_nearest_minutes_zero_or_one_is_a_no_op() {
+        let t = NaiveTime::parse_from_str("12:58", "%H:%M").unwrap();
+        assert_eq!(round_to_nearest_minutes(t, 0), t);
+        assert_eq!(round_to_nearest_minutes(t, 1), t);
     }
 
     #[test]

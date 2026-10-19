@@ -87,6 +87,10 @@ fn default_estimated_lunch_break() -> u32 {
     30
 }
 
+fn default_round_to_minutes() -> u32 {
+    1
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default = "default_estimated_lunch_break")]
@@ -96,6 +100,11 @@ pub struct Config {
     /// (which they already have regardless of this flag).
     #[serde(default)]
     pub hide_weekends: bool,
+    /// The TUI rounds a suggested time (e.g. the add-entry form's "Start",
+    /// prefilled with now) to the nearest multiple of this many minutes -
+    /// e.g. 5 turns 12:58 into 13:00. 1 (the default) means no rounding.
+    #[serde(default = "default_round_to_minutes")]
+    pub round_to_minutes: u32,
 }
 
 impl Default for Config {
@@ -103,6 +112,7 @@ impl Default for Config {
         Config {
             estimated_lunch_break_minutes: default_estimated_lunch_break(),
             hide_weekends: false,
+            round_to_minutes: default_round_to_minutes(),
         }
     }
 }

@@ -55,6 +55,7 @@ Configuration in `~/.config/clockout/config.toml`. For example:
 ```toml
 estimated_lunch_break_minutes = 30 # Assumed lunch break time, used for estimation
 hide_weekends = false # Leave Saturday/Sunday out of the week diagram, day navigation, and history view
+round_to_minutes = 5 # Round a suggested time (e.g. a new entry's "Start", prefilled with now) to the nearest 5 minutes - 1 (the default) means no rounding
 ```
 
 The weekly-hours goal isn't in `config.toml` - it lives in `entries.json` as

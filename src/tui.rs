@@ -306,6 +306,13 @@ impl App {
         self.selected = 0;
     }
 
+    /// Now, rounded to `Config::round_to_minutes` - used to prefill a
+    /// suggested time in a form (e.g. a new entry's start) rather than the
+    /// exact wall-clock time. Never used for a stored time, only a suggestion.
+    fn suggested_now(&self) -> NaiveTime {
+        calc::round_to_nearest_minutes(Local::now().time(), self.config.round_to_minutes)
+    }
+
     /// Open the add-entry modal, prefilled with the focused day and now.
     /// Leaving the end field blank on submit starts an open-ended block
     /// instead of a closed entry.
@@ -314,7 +321,7 @@ impl App {
             kind: ModalKind::AddEdit,
             editing_id: None,
             date_buf: self.focused_day.to_string(),
-            start_buf: Local::now().time().format("%H:%M").to_string(),
+            start_buf: self.suggested_now().format("%H:%M").to_string(),
             end_buf: String::new(),
             time_buf: String::new(),
             hours_buf: String::new(),
@@ -399,6 +406,7 @@ impl App {
     /// since this just adjusts fields on the same record rather than
     /// converting between record kinds.
     fn toggle_absence_interval(&mut self) {
+        let now = self.suggested_now();
         let Mode::Modal(m) = &mut self.mode else {
             return;
         };
@@ -407,7 +415,7 @@ impl App {
         }
         m.absence_interval = !m.absence_interval;
         if m.absence_interval && m.start_buf.trim().is_empty() {
-            m.start_buf = Local::now().time().format("%H:%M").to_string();
+            m.start_buf = now.format("%H:%M").to_string();
         }
         m.focus = 0;
         m.field_selected = true;
@@ -449,7 +457,7 @@ impl App {
             date_buf: String::new(),
             start_buf: String::new(),
             end_buf: String::new(),
-            time_buf: Local::now().time().format("%H:%M").to_string(),
+            time_buf: self.suggested_now().format("%H:%M").to_string(),
             hours_buf: String::new(),
             absence_interval: false,
             focus: 0,
@@ -1195,6 +1203,13 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> Result<(
                         m.field_selected = false;
                     }
                     current_buf(m).push(c);
+                }
+                // Moving within the field collapses the "selected" state
+                // without touching its text - same as a normal text input,
+                // where arrowing into selected text deselects it instead of
+                // the next keystroke overwriting it.
+                KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                    m.field_selected = false;
                 }
                 _ => {}
             }
