@@ -275,7 +275,10 @@ fn cmd_start(
     let entry_date = resolve_date(&day, &date, today).map_err(|e| anyhow::anyhow!(e))?;
     let start = match time {
         Some(t) => parse::parse_time(&t).map_err(|e| anyhow::anyhow!(e))?,
-        None => Local::now().time(),
+        None => {
+            let cfg = storage::load_config()?;
+            calc::round_to_nearest_minutes(Local::now().time(), cfg.round_to_minutes)
+        }
     };
     let candidate = storage::with_entries(|data| {
         if let Some(open) = calc::open_entry(&data.entries) {
@@ -336,15 +339,18 @@ fn close_open_block(
         let Some(idx) = data.entries.iter().position(|e| e.end.is_none()) else {
             return Ok(None);
         };
-        let end = match &time {
-            Some(t) => parse::parse_time(t).map_err(|e| anyhow::anyhow!(e))?,
-            None => Local::now().time(),
-        };
         let (id, entry_date, start) = (
             data.entries[idx].id,
             data.entries[idx].date,
             data.entries[idx].start,
         );
+        let end = match &time {
+            Some(t) => parse::parse_time(t).map_err(|e| anyhow::anyhow!(e))?,
+            None => {
+                let cfg = storage::load_config()?;
+                calc::round_end_for_closing(Local::now().time(), start, cfg.round_to_minutes)
+            }
+        };
         if start >= end {
             anyhow::bail!(
                 "end {} must be after start {}",
@@ -391,10 +397,11 @@ fn cmd_end(time: Option<String>) -> anyhow::Result<()> {
 }
 
 /// Closes the open block at now (if any - a no-op otherwise, not an
-/// error), then shows the same summary `cmd_status` does. Nothing is
-/// "updated" beyond that write: the time debt/surplus shown is already
-/// always live-derived from entries, never stored - this just surfaces
-/// it at the moment you stop for the day.
+/// error), then shows the same summary `cmd_status` does, with its
+/// "Clocked out at" line - nothing is written for this beyond the close
+/// itself; the debt/surplus shown is already always live-derived from
+/// entries, never stored, and `cmd_status` only shows "Clocked out at"
+/// here because `done` (not plain `end`) is what's asking for it.
 fn cmd_done(time: Option<String>, today: NaiveDate) -> anyhow::Result<()> {
     if let Some((id, entry_date, start, end)) = close_open_block(time)? {
         println!(
@@ -405,10 +412,18 @@ fn cmd_done(time: Option<String>, today: NaiveDate) -> anyhow::Result<()> {
             end.format("%H:%M")
         );
     }
-    cmd_status(today)
+    cmd_status_inner(today, true)
 }
 
 fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
+    cmd_status_inner(today, false)
+}
+
+/// `just_clocked_out` is true only when called from `cmd_done` within the
+/// same process, so its "Clocked out at" line reflects that explicit
+/// action rather than just every block happening to be closed - nothing is
+/// stored for this, it only ever applies to the invocation that asked.
+fn cmd_status_inner(today: NaiveDate, just_clocked_out: bool) -> anyhow::Result<()> {
     let cfg = storage::load_config()?;
     let data = storage::load_entries()?;
     let now = Local::now().time();
@@ -484,7 +499,8 @@ fn cmd_status(today: NaiveDate) -> anyhow::Result<()> {
                 )
             );
         }
-        if let Some(clocked_out) = calc::clocked_out_at(&data.entries, today) {
+        let clocked_out_on = just_clocked_out.then_some(today);
+        if let Some(clocked_out) = calc::clocked_out_at(&data.entries, clocked_out_on, today) {
             println!(
                 "Clocked out: {}",
                 paint.color(clocked_out.format("%H:%M").to_string(), SUCCESS)

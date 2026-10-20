@@ -161,13 +161,23 @@ pub fn entries_on(entries: &[TimeEntry], day: NaiveDate) -> Vec<&TimeEntry> {
     entries.iter().filter(|e| e.date == day).collect()
 }
 
-/// If you're done for the day - nothing currently open, and at least one
-/// closed entry logged for `today` - the clock time the last one ended.
-/// `None` while still actively working (an open block, on any day) or
-/// before you've logged anything today at all, so callers can show this
-/// instead of a "Leave at" projection only once there's actually
-/// something to report as "clocked out at".
-pub fn clocked_out_at(entries: &[TimeEntry], today: NaiveDate) -> Option<NaiveTime> {
+/// If you've explicitly clocked out for `today` (TUI `c`, `clockout done` -
+/// see `EntriesFile::clocked_out_on`) and nothing's open since, the clock
+/// time your last closed entry for `today` ended. `None` otherwise - still
+/// actively working (an open block, on any day), before you've logged
+/// anything today, or every block just happens to be closed without you
+/// having said you're done (closing the last one with `f`/`clockout end`
+/// alone does NOT count - only the explicit clock-out action does) - so
+/// callers can show this instead of a "Leave at" projection only once
+/// there's actually something to report as "clocked out at".
+pub fn clocked_out_at(
+    entries: &[TimeEntry],
+    clocked_out_on: Option<NaiveDate>,
+    today: NaiveDate,
+) -> Option<NaiveTime> {
+    if clocked_out_on != Some(today) {
+        return None;
+    }
     if open_entry(entries).is_some() {
         return None;
     }
@@ -415,9 +425,10 @@ pub fn overlaps(a: &TimeEntry, b: &TimeEntry) -> bool {
 
 /// Rounds `time` to the nearest multiple of `minutes` (half rounds up),
 /// wrapping around midnight - e.g. with `minutes` 5, 12:58 -> 13:00 and
-/// 23:59 -> 00:00. `minutes` 0 or 1 is a no-op (nothing to round to).
-/// Used to round a suggested time (e.g. "now") before showing it in a
-/// form, per `Config::round_to_minutes` - never applied to a stored time.
+/// 23:59 -> 00:00. `minutes` 0 or 1 is a no-op (nothing to round to). Used
+/// wherever "now" becomes a suggested or default time - a new entry's
+/// start, an open block's end when none is given - per
+/// `Config::round_to_minutes`; never applied to an already-stored time.
 pub fn round_to_nearest_minutes(time: NaiveTime, minutes: u32) -> NaiveTime {
     if minutes <= 1 {
         return time;
@@ -426,6 +437,29 @@ pub fn round_to_nearest_minutes(time: NaiveTime, minutes: u32) -> NaiveTime {
     let total = (time.hour() * 60 + time.minute()) as i64;
     let rounded = ((total + minutes / 2) / minutes * minutes).rem_euclid(24 * 60);
     NaiveTime::from_hms_opt((rounded / 60) as u32, (rounded % 60) as u32, 0).unwrap()
+}
+
+/// `round_to_nearest_minutes(now, minutes)`, but bumped to one minute past
+/// `start` if rounding would put it at or before `start` instead - e.g.
+/// starting and ending in quick succession, both landing in the same
+/// rounding bucket (or `start` itself having been rounded *forward* of the
+/// real current time). Always returns something after `start`, so this
+/// never manufactures a "must be after start" error - every stored time is
+/// minute-precision (parsed back from "HH:MM" text), so falling back to an
+/// exact, sub-minute "now" wouldn't actually avoid the collision once it
+/// round-trips through a form field.
+pub fn round_end_for_closing(now: NaiveTime, start: NaiveTime, minutes: u32) -> NaiveTime {
+    // Every stored/displayed time in this app is minute-precision (parsed
+    // back from "HH:MM" text) - drop `now`'s seconds up front so this
+    // decides based on what will actually be compared later, rather than
+    // a sub-minute edge that formatting would discard anyway.
+    let now = NaiveTime::from_hms_opt(now.hour(), now.minute(), 0).unwrap();
+    let rounded = round_to_nearest_minutes(now, minutes);
+    if rounded > start {
+        rounded
+    } else {
+        start + Duration::minutes(1)
+    }
 }
 
 /// Formats a minute count as "Xh" when there are no leftover minutes, or
@@ -1190,6 +1224,49 @@ mod tests {
     }
 
     #[test]
+    fn round_end_for_closing_uses_the_rounded_time_when_after_start() {
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        assert_eq!(round_end_for_closing(t("12:58"), t("08:00"), 5), t("13:00"));
+    }
+
+    #[test]
+    fn round_end_for_closing_bumps_a_minute_past_start_on_collision() {
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        // now=11:41 rounds to 11:40 (nearest 10), same as start - bumped to
+        // one minute past start instead of colliding.
+        assert_eq!(
+            round_end_for_closing(t("11:41"), t("11:40"), 10),
+            t("11:41")
+        );
+    }
+
+    #[test]
+    fn round_end_for_closing_ignores_seconds_that_formatting_would_discard() {
+        // With no rounding configured (minutes <= 1), starting and
+        // finishing within the same real minute must still bump forward,
+        // not rely on `now`'s seconds surviving - every stored/displayed
+        // time is "HH:MM" only, so those seconds never actually land.
+        let start = NaiveTime::from_hms_opt(12, 35, 0).unwrap();
+        let now = NaiveTime::from_hms_opt(12, 35, 47).unwrap();
+        assert_eq!(
+            round_end_for_closing(now, start, 1),
+            NaiveTime::from_hms_opt(12, 36, 0).unwrap()
+        );
+    }
+
+    #[test]
+    fn round_end_for_closing_bumps_past_a_start_rounded_into_the_future() {
+        let t = |s: &str| NaiveTime::parse_from_str(s, "%H:%M").unwrap();
+        // start was itself rounded forward to 11:50; closing moments later
+        // at 11:46 would otherwise round to 11:50 too (a collision) - or,
+        // without rounding's help, be flatly before start.
+        assert_eq!(
+            round_end_for_closing(t("11:46"), t("11:50"), 10),
+            t("11:51")
+        );
+    }
+
+    #[test]
     fn leave_time_no_gap_applies_default_padding() {
         let c = cfg(30);
         let g = goal_periods(40.0);
@@ -1459,17 +1536,17 @@ mod tests {
     #[test]
     fn clocked_out_at_none_before_anything_logged_today() {
         let today = date(2026, 9, 11);
-        assert_eq!(clocked_out_at(&[], today), None);
+        assert_eq!(clocked_out_at(&[], Some(today), today), None);
     }
 
     #[test]
     fn clocked_out_at_none_while_a_block_is_open() {
         let today = date(2026, 9, 11);
         let entries = vec![open(1, today, "08:00")];
-        assert_eq!(clocked_out_at(&entries, today), None);
+        assert_eq!(clocked_out_at(&entries, Some(today), today), None);
         // Even an open block from a past day still counts as "still going".
         let entries = vec![open(1, date(2026, 9, 10), "22:00")];
-        assert_eq!(clocked_out_at(&entries, today), None);
+        assert_eq!(clocked_out_at(&entries, Some(today), today), None);
     }
 
     #[test]
@@ -1480,9 +1557,27 @@ mod tests {
             entry(2, today, "13:00", "17:00"),
         ];
         assert_eq!(
-            clocked_out_at(&entries, today),
+            clocked_out_at(&entries, Some(today), today),
             Some(NaiveTime::parse_from_str("17:00", "%H:%M").unwrap())
         );
+    }
+
+    #[test]
+    fn clocked_out_at_none_without_explicit_clock_out_even_if_fully_closed() {
+        // Every block for today is closed, but the user never pressed
+        // `c`/ran `clockout done` - finishing the last block with `f`/
+        // `clockout end` alone must not look like clocking out.
+        let today = date(2026, 9, 11);
+        let entries = vec![entry(1, today, "08:00", "12:00")];
+        assert_eq!(clocked_out_at(&entries, None, today), None);
+    }
+
+    #[test]
+    fn clocked_out_at_none_if_clocked_out_on_a_different_day() {
+        let today = date(2026, 9, 11);
+        let yesterday = date(2026, 9, 10);
+        let entries = vec![entry(1, today, "08:00", "12:00")];
+        assert_eq!(clocked_out_at(&entries, Some(yesterday), today), None);
     }
 
     #[test]

@@ -132,6 +132,13 @@ struct App {
     entries: Vec<TimeEntry>,
     goal_periods: Vec<GoalPeriod>,
     absences: Vec<Absence>,
+    /// The day you last pressed `c` (clock out) in this running session -
+    /// purely in-memory, never written to entries.json. Drives the
+    /// "Clocked out at" status (see `calc::clocked_out_at`) so it only
+    /// follows that explicit action, not just every block happening to be
+    /// closed. Cleared by any further change to logged time, and lost on
+    /// restart (same as any other in-memory UI state).
+    clocked_out_on: Option<NaiveDate>,
     config: Config,
     /// The day whose entries show in the entries panel and whose row is
     /// marked in the week diagram. Defaults to today; moved with j/k while
@@ -166,6 +173,7 @@ impl App {
             entries: data.entries,
             goal_periods: data.goal_periods,
             absences: data.absences,
+            clocked_out_on: None,
             config,
             focused_day: Local::now().date_naive(),
             focus_pane: Pane::Entries,
@@ -444,20 +452,25 @@ impl App {
     /// Open the "finish the open block" modal, prefilled with now. Refuses
     /// if there is no open block.
     fn open_finish(&mut self) {
-        if calc::open_entry(&self.entries).is_none() {
+        let Some(open_start) = calc::open_entry(&self.entries).map(|e| e.start) else {
             self.set_status(
                 StatusKind::Error,
                 "no open block to finish - press a to start one",
             );
             return;
-        }
+        };
+        let suggested = calc::round_end_for_closing(
+            Local::now().time(),
+            open_start,
+            self.config.round_to_minutes,
+        );
         self.mode = Mode::Modal(ModalState {
             kind: ModalKind::End,
             editing_id: None,
             date_buf: String::new(),
             start_buf: String::new(),
             end_buf: String::new(),
-            time_buf: self.suggested_now().format("%H:%M").to_string(),
+            time_buf: suggested.format("%H:%M").to_string(),
             hours_buf: String::new(),
             absence_interval: false,
             focus: 0,
@@ -656,6 +669,7 @@ impl App {
         match result {
             Ok(entries) => {
                 self.entries = entries;
+                self.clocked_out_on = None;
                 self.mode = Mode::Normal;
                 self.set_status(StatusKind::Info, "saved");
             }
@@ -678,6 +692,7 @@ impl App {
         match close_open_block(time) {
             Ok(Some((entries, start))) => {
                 self.entries = entries;
+                self.clocked_out_on = None;
                 self.mode = Mode::Normal;
                 self.set_status(
                     StatusKind::Info,
@@ -695,12 +710,21 @@ impl App {
     }
 
     /// "I'm done for the day": closes the open block at `now` (if any -
-    /// a no-op otherwise, not an error), then reports a one-line
-    /// end-of-day summary - hours worked vs target, and the resulting
-    /// time debt/surplus, which `done` doesn't compute or store anything
-    /// new for, it's already always live-derived from entries.
+    /// a no-op otherwise, not an error), marks today as explicitly clocked
+    /// out in memory only (`App::clocked_out_on`, which drives the
+    /// header's "Clocked out at" - nothing is written to entries.json for
+    /// this), then reports a one-line end-of-day summary - hours worked
+    /// vs target and the resulting time debt/surplus, which are still
+    /// always live-derived from entries, never stored.
     fn clock_out(&mut self) -> Result<()> {
-        let now = Local::now().time();
+        let now = match calc::open_entry(&self.entries) {
+            Some(open) => calc::round_end_for_closing(
+                Local::now().time(),
+                open.start,
+                self.config.round_to_minutes,
+            ),
+            None => Local::now().time(),
+        };
         match close_open_block(now) {
             Ok(Some((entries, _start))) => self.entries = entries,
             Ok(None) => {}
@@ -711,6 +735,7 @@ impl App {
         }
 
         let today = self.today();
+        self.clocked_out_on = Some(today);
         let worked_today =
             calc::worked_minutes(&calc::entries_on(&self.entries, today), today, now);
         let target_today = calc::daily_target_minutes(&self.goal_periods, &self.absences, today);
@@ -954,6 +979,7 @@ impl App {
                     Ok(data.entries.clone())
                 })?;
                 self.entries = entries;
+                self.clocked_out_on = None;
                 self.mode = Mode::Normal;
                 self.set_status(StatusKind::Info, format!("deleted #{id}"));
             }
@@ -1325,7 +1351,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
                 ),
             ]
         }
-    } else if let Some(clocked_out) = calc::clocked_out_at(&app.entries, today) {
+    } else if let Some(clocked_out) = calc::clocked_out_at(&app.entries, app.clocked_out_on, today)
+    {
         vec![
             Span::styled(
                 "Clocked out at ",
