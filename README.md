@@ -2,6 +2,8 @@
 
 CLI and TUI to track worked hours against a weekly goal, and see what time you can leave for the day.
 
+<img width="800" alt="Image" src="https://github.com/user-attachments/assets/82c65867-80ef-4f7d-8c99-883745d6091e" />
+
 ## Usage
 
 ### TUI
